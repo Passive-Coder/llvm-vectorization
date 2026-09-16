@@ -31,7 +31,7 @@ const HISTORY_CAP: usize = 8;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(80);
 
-// A Claude-Code-inspired palette: warm rust/orange accent on a neutral,
+// A warm rust/orange palette on a neutral,
 // mostly-monochrome backdrop, rather than the primary cyan/yellow of a
 // typical TUI form.
 const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
@@ -806,7 +806,7 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 }
 
 /// A moving highlight sweeping across `text`, the same shimmering-text
-/// effect Claude's own CLI uses while it's working, built from a per-
+/// effect used while it's working, built from a per-
 /// character sine wave so it needs no extra crate or animation state.
 fn shimmer_spans(text: &str, tick: u64, dim: Color, bright: Color) -> Vec<Span<'static>> {
     text.chars()
