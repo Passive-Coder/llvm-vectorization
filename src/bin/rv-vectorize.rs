@@ -242,11 +242,28 @@ fn llvm_prefix_candidates(options: &Options) -> Vec<PathBuf> {
         ]
         .map(PathBuf::from),
     );
+    if cfg!(windows) {
+        candidates.extend(
+            [
+                r"C:\Program Files\LLVM",
+                r"C:\Program Files (x86)\LLVM",
+                r"C:\LLVM",
+            ]
+            .map(PathBuf::from),
+        );
+    }
     candidates
 }
 
 fn is_llvm_21_opt(path: &Path) -> bool {
-    Command::new(path)
+    let mut check_path = path.to_path_buf();
+    if cfg!(windows) && check_path.extension().is_none() {
+        let exe_candidate = check_path.with_extension("exe");
+        if exe_candidate.is_file() {
+            check_path = exe_candidate;
+        }
+    }
+    Command::new(&check_path)
         .arg("--version")
         .output()
         .is_ok_and(|output| {
@@ -269,6 +286,12 @@ fn resolve_opt(options: &Options) -> Result<PathBuf, String> {
         let candidate = prefix.join("bin/opt");
         if is_llvm_21_opt(&candidate) {
             return Ok(candidate);
+        }
+        if cfg!(windows) {
+            let exe_candidate = prefix.join("bin/opt.exe");
+            if is_llvm_21_opt(&exe_candidate) {
+                return Ok(exe_candidate);
+            }
         }
     }
     Err("LLVM 21 opt was not found; use --opt, --llvm-prefix, or LLVM_SYS_211_PREFIX".to_owned())

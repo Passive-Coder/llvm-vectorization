@@ -70,7 +70,10 @@ fn main() {
         }
     }
 
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libdir.trim());
+    let target = env::var("TARGET").unwrap_or_default();
+    if !target.contains("msvc") && !target.contains("windows") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libdir.trim());
+    }
     println!("cargo:rustc-env=RV_LLVM_VERSION={}", version.trim());
 }
 
@@ -86,6 +89,12 @@ fn find_llvm_config() -> Option<PathBuf> {
         let path = PathBuf::from(prefix).join("bin/llvm-config");
         if is_llvm_config(&path) {
             return Some(path);
+        }
+        if cfg!(windows) {
+            let exe_path = PathBuf::from(prefix).join("bin/llvm-config.exe");
+            if is_llvm_config(&exe_path) {
+                return Some(exe_path);
+            }
         }
     }
 
@@ -107,14 +116,38 @@ fn find_llvm_config() -> Option<PathBuf> {
             return Some(path);
         }
     }
+
+    if cfg!(windows) {
+        for path in [
+            r"C:\Program Files\LLVM\bin\llvm-config.exe",
+            r"C:\Program Files (x86)\LLVM\bin\llvm-config.exe",
+            r"C:\LLVM\bin\llvm-config.exe",
+        ] {
+            let path = PathBuf::from(path);
+            if is_llvm_config(&path) {
+                return Some(path);
+            }
+        }
+    }
+
     None
 }
 
 fn find_on_path(executable: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|paths| {
-        env::split_paths(&paths)
-            .map(|path| path.join(executable))
-            .find(|path| path.is_file())
+        env::split_paths(&paths).find_map(|path| {
+            let candidate = path.join(executable);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            if cfg!(windows) {
+                let exe_candidate = path.join(format!("{executable}.exe"));
+                if exe_candidate.is_file() {
+                    return Some(exe_candidate);
+                }
+            }
+            None
+        })
     })
 }
 
