@@ -16,6 +16,24 @@ pub(crate) struct Plan {
     /// hardware SIMD occupancy; full-vector execution itself has no masked
     /// inactive lanes because the remainder stays scalar.
     pub(crate) vector_coverage_x100: u64,
+    /// Estimated speedup ratio multiplied by 100 (e.g. 200 = 2.0x speedup).
+    pub(crate) speedup_x100: u64,
+}
+
+impl Plan {
+    /// Computes the estimated speedup multiplier as a floating-point ratio.
+    pub(crate) fn estimated_speedup(self) -> f64 {
+        if self.vector_cost == 0 {
+            1.0
+        } else {
+            self.scalar_cost as f64 / self.vector_cost as f64
+        }
+    }
+
+    /// Computes total contiguous bytes transferred per vector loop iteration.
+    pub(crate) const fn vector_bytes_per_iteration(self, element_bytes: u32) -> u32 {
+        self.vf.saturating_mul(element_bytes)
+    }
 }
 
 pub(crate) fn choose_plan(
@@ -52,6 +70,12 @@ pub(crate) fn choose_plan(
         return None;
     }
 
+    let speedup_x100 = if vector_cost == 0 {
+        100
+    } else {
+        scalar_cost.saturating_mul(100) / vector_cost
+    };
+
     Some(Plan {
         vf: candidate_vf,
         scalar_cost,
@@ -60,6 +84,7 @@ pub(crate) fn choose_plan(
             .saturating_mul(u64::from(candidate_vf))
             .saturating_mul(100)
             / estimated_trip_count,
+        speedup_x100,
     })
 }
 
@@ -170,5 +195,64 @@ mod tests {
         )
         .expect("two full vector iterations are profitable");
         assert_eq!(plan.vector_coverage_x100, 80);
+    }
+
+    #[test]
+    fn rejects_zero_inputs() {
+        let base_costs = LoopCosts {
+            scalar_iteration: 4,
+            vector_iteration: 4,
+            setup: 0,
+        };
+        assert_eq!(choose_plan(config(Heuristic::Balanced), 0, 64, base_costs), None);
+        assert_eq!(choose_plan(config(Heuristic::Balanced), 32, 0, base_costs), None);
+        assert_eq!(
+            choose_plan(
+                config(Heuristic::Balanced),
+                32,
+                64,
+                LoopCosts {
+                    scalar_iteration: 0,
+                    vector_iteration: 4,
+                    setup: 0,
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn saturating_arithmetic_prevents_overflow_panic() {
+        let plan = choose_plan(
+            config(Heuristic::Aggressive),
+            32,
+            u64::MAX - 1,
+            LoopCosts {
+                scalar_iteration: 10,
+                vector_iteration: 5,
+                setup: 6,
+            },
+        );
+        assert!(plan.is_some());
+        let plan = plan.unwrap();
+        assert_eq!(plan.vf, 4);
+    }
+
+    #[test]
+    fn plan_architectural_metrics_and_bandwidth() {
+        let plan = choose_plan(
+            config(Heuristic::Balanced),
+            32,
+            64,
+            LoopCosts {
+                scalar_iteration: 8,
+                vector_iteration: 8,
+                setup: 6,
+            },
+        )
+        .expect("should produce valid plan");
+        assert!(plan.speedup_x100 > 100);
+        assert!(plan.estimated_speedup() > 1.0);
+        assert_eq!(plan.vector_bytes_per_iteration(4), 16); // VF=4 * 4 bytes = 16 bytes
     }
 }

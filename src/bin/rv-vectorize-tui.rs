@@ -975,12 +975,99 @@ fn history_lines(entry: &HistoryEntry, spinner: &str, tick: u64) -> Vec<Line<'st
         }
     }
     for detail_line in entry.detail.lines() {
+        lines.extend(format_detail_line(detail_line));
+    }
+    lines.push(Line::raw(""));
+    lines
+}
+
+fn remediation_hint(reason: &str) -> Option<&'static str> {
+    match reason {
+        "possible-pointer-alias" => {
+            Some("Pointers may alias. Add 'noalias' or C 'restrict' to prove disjointness.")
+        }
+        "loop-carried-memory-dependence" => {
+            Some("Loop-carried memory hazard (distance > 0). Cross-iteration dependencies cannot be widened.")
+        }
+        "unsupported-instruction" => {
+            Some("Unsupported opcode (e.g., call, invoke, or atomic). Only pure scalar compute is accepted.")
+        }
+        "volatile-or-atomic-memory" => {
+            Some("Volatile or atomic memory operations cannot be widened into vector instructions.")
+        }
+        "disabled-by-loop-metadata" => {
+            Some("Vectorization is explicitly disabled by !llvm.loop metadata.")
+        }
+        "not-profitable" => {
+            Some("Estimated speedup is below heuristic threshold. Try aggressive policy or force a vector factor (--vf).")
+        }
+        "induction-type-must-be-i64" => {
+            Some("Loop counter must be i64. Promote 32-bit loop index to 64-bit.")
+        }
+        "induction-must-start-at-zero" => {
+            Some("Canonical induction variable must start at 0.")
+        }
+        "induction-step-must-be-one" => {
+            Some("Induction step must be exactly +1.")
+        }
+        "loop-value-live-out" => {
+            Some("A loop-computed value is used outside the loop. Reductions/live-outs are outside the contract.")
+        }
+        "live-out-phi" => {
+            Some("Exit block contains a PHI node.")
+        }
+        "memory-pointer-must-be-loop-gep" => {
+            Some("Pointers must be computed via 1D affine GEP (base[i + C]) directly inside the loop.")
+        }
+        "incompatible-target-memory-layout" => {
+            Some("Target DataLayout must specify 64-bit pointer indices and packed vector storage.")
+        }
+        _ => None,
+    }
+}
+
+fn format_detail_line(detail_line: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(rest) = detail_line.strip_prefix("rv-vectorize:") {
+        let is_vectorized = rest.contains("decision=vectorized");
+        let is_rejected = rest.contains("decision=rejected");
+        let mut spans = vec![Span::styled("  rv-vectorize:", Style::default().fg(ACCENT_DIM))];
+
+        if is_vectorized {
+            spans.push(Span::styled(
+                " [vectorized] ",
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ));
+        } else if is_rejected {
+            spans.push(Span::styled(
+                " [rejected] ",
+                Style::default().fg(FAILURE).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        spans.push(Span::styled(rest.to_string(), Style::default().fg(TEXT)));
+        lines.push(Line::from(spans));
+
+        if is_rejected {
+            if let Some(reason_part) = rest.split_whitespace().find(|atom| atom.starts_with("reason=")) {
+                let reason = reason_part.trim_start_matches("reason=");
+                if let Some(hint) = remediation_hint(reason) {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "    💡 Hint: ",
+                            Style::default().fg(PENDING).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(hint, Style::default().fg(TEXT)),
+                    ]));
+                }
+            }
+        }
+    } else {
         lines.push(Line::from(Span::styled(
             format!("  {detail_line}"),
             Style::default().fg(MUTED),
         )));
     }
-    lines.push(Line::raw(""));
     lines
 }
 
