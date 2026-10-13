@@ -171,4 +171,45 @@ mod tests {
         .expect("two full vector iterations are profitable");
         assert_eq!(plan.vector_coverage_x100, 80);
     }
+
+    #[test]
+    fn rejects_zero_inputs() {
+        let base_costs = LoopCosts {
+            scalar_iteration: 4,
+            vector_iteration: 4,
+            setup: 0,
+        };
+        assert_eq!(choose_plan(config(Heuristic::Balanced), 0, 64, base_costs), None);
+        assert_eq!(choose_plan(config(Heuristic::Balanced), 32, 0, base_costs), None);
+        assert_eq!(
+            choose_plan(
+                config(Heuristic::Balanced),
+                32,
+                64,
+                LoopCosts {
+                    scalar_iteration: 0,
+                    vector_iteration: 4,
+                    setup: 0,
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn saturating_arithmetic_prevents_overflow_panic() {
+        let plan = choose_plan(
+            config(Heuristic::Aggressive),
+            32,
+            u64::MAX - 1,
+            LoopCosts {
+                scalar_iteration: 10,
+                vector_iteration: 5,
+                setup: 6,
+            },
+        );
+        assert!(plan.is_some());
+        let plan = plan.unwrap();
+        assert_eq!(plan.vf, 4);
+    }
 }

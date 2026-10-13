@@ -1,4 +1,4 @@
-.PHONY: build cli tui test lint differential differential-full benchmark clean
+.PHONY: build cli tui test test-py lint differential differential-full benchmark clean
 
 build:
 	cargo build --release
@@ -12,6 +12,9 @@ tui:
 
 test:
 	./scripts/test.sh
+
+test-py:
+	python3 ./scripts/test.py
 
 lint:
 	cargo fmt --check

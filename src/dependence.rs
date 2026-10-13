@@ -173,4 +173,42 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn different_base_pointers_are_always_independent() {
+        let left = AffineAccess {
+            base: 1,
+            coefficient: 1,
+            offset: 0,
+            kind: AccessKind::Write,
+        };
+        let right = AffineAccess {
+            base: 2,
+            coefficient: 1,
+            offset: 0,
+            kind: AccessKind::Write,
+        };
+        assert_eq!(classify(left, right), Dependence::Independent);
+    }
+
+    #[test]
+    fn zero_coefficients_constant_offset_checks() {
+        let same = access(0, 42, AccessKind::Write);
+        let same_read = access(0, 42, AccessKind::Read);
+        assert_eq!(classify(same, same_read), Dependence::SameIteration);
+
+        let different = access(0, 10, AccessKind::Write);
+        let different_read = access(0, 20, AccessKind::Read);
+        assert_eq!(classify(different, different_read), Dependence::Independent);
+    }
+
+    #[test]
+    fn negative_distance_recurrence_is_detected() {
+        let write = access(1, 0, AccessKind::Write);
+        let earlier_read = access(1, 2, AccessKind::Read);
+        assert_eq!(
+            classify(write, earlier_read),
+            Dependence::LoopCarried { distance: -2 }
+        );
+    }
 }
