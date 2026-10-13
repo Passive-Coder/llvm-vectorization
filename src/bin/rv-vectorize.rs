@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -14,6 +15,7 @@ OPTIONS:
         --policy <POLICY>     balanced, conservative, or aggressive
         --vf <WIDTH>          auto, 2, 4, 8, or 16
         --report              Print per-loop decisions to stderr
+        --json                Print per-loop decisions as structured JSON to stderr
         --emit-bitcode        Emit LLVM bitcode instead of textual IR
         --no-verify           Do not run LLVM's verifier after the pass
         --llvm-prefix <PATH>  LLVM 21 installation prefix
@@ -91,6 +93,7 @@ struct Options {
     policy: Policy,
     vector_width: VectorWidth,
     report: bool,
+    json: bool,
     emit_bitcode: bool,
     verify: bool,
     llvm_prefix: Option<PathBuf>,
@@ -165,6 +168,9 @@ fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
             )?));
         } else if text == Some("--report") {
             options.report = true;
+        } else if text == Some("--json") {
+            options.json = true;
+            options.report = true;
         } else if text == Some("--emit-bitcode") {
             options.emit_bitcode = true;
         } else if text == Some("--no-verify") {
@@ -210,7 +216,7 @@ fn pass_pipeline(options: &Options) -> String {
         VectorWidth::Auto => options.policy.pass_stem().to_owned(),
         VectorWidth::Fixed(width) => format!("rust-loop-vectorize-force-vf{width}"),
     };
-    if options.report {
+    if options.report || options.json {
         pass.push_str("-report");
     }
     if options.verify {
@@ -399,6 +405,28 @@ fn run(options: &Options) -> Result<(), String> {
         return Ok(());
     }
 
+    if options.json {
+        let output = command
+            .output()
+            .map_err(|error| format!("failed to execute {}: {error}", opt.display()))?;
+        if !output.status.success() {
+            if !output.stderr.is_empty() {
+                eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            }
+            return Err(match output.status.code() {
+                Some(code) => format!("LLVM opt exited with status {code}"),
+                None => "LLVM opt was terminated by a signal".to_owned(),
+            });
+        }
+        if !output.stdout.is_empty() {
+            let _ = io::stdout().write_all(&output.stdout);
+        }
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        let records = parse_remarks_to_json(&stderr_text);
+        eprintln!("{records}");
+        return Ok(());
+    }
+
     let status = command
         .status()
         .map_err(|error| format!("failed to execute {}: {error}", opt.display()))?;
@@ -410,6 +438,30 @@ fn run(options: &Options) -> Result<(), String> {
             None => "LLVM opt was terminated by a signal".to_owned(),
         })
     }
+}
+
+fn parse_remarks_to_json(stderr: &str) -> String {
+    let mut entries = Vec::new();
+    for line in stderr.lines() {
+        if let Some(rest) = line.trim().strip_prefix("rv-vectorize:") {
+            let mut fields = Vec::new();
+            for atom in rest.split_whitespace() {
+                if let Some((k, v)) = atom.split_once('=') {
+                    if let Ok(num) = v.parse::<i64>() {
+                        fields.push(format!("      \"{k}\": {num}"));
+                    } else if let Ok(num) = v.parse::<f64>() {
+                        fields.push(format!("      \"{k}\": {num}"));
+                    } else {
+                        fields.push(format!("      \"{k}\": \"{v}\""));
+                    }
+                }
+            }
+            if !fields.is_empty() {
+                entries.push(format!("    {{\n{}\n    }}", fields.join(",\n")));
+            }
+        }
+    }
+    format!("[\n{}\n]", entries.join(",\n"))
 }
 
 fn main() -> ExitCode {
@@ -497,5 +549,24 @@ mod tests {
             shell_quote(OsStr::new("it's here.ll")),
             "'it'\\''s here.ll'"
         );
+    }
+
+    #[test]
+    fn parses_json_flag() {
+        let Parsed::Run(options) = parse_args(&args(&["--json", "in.ll"]))
+            .expect("valid arguments") else {
+                panic!("expected runnable options");
+            };
+        assert!(options.json);
+        assert!(options.report);
+    }
+
+    #[test]
+    fn remarks_to_json_formatting() {
+        let remarks = "rv-vectorize: function=add_f32 loop=loop decision=vectorized vf=4";
+        let json = parse_remarks_to_json(remarks);
+        assert!(json.contains("\"function\": \"add_f32\""));
+        assert!(json.contains("\"vf\": 4"));
+        assert!(json.contains("\"decision\": \"vectorized\""));
     }
 }
