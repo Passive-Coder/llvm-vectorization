@@ -191,7 +191,7 @@ impl fmt::Debug for App {
             .field("history_len", &self.history.len())
             .field("running", &self.worker.is_some())
             .field("view", &self.view)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -655,6 +655,7 @@ fn shell_quote(value: &str) -> String {
 /// strings, GitHub-review style: unchanged lines stay level on both
 /// sides, and removed/added lines pad the other side with a blank row so
 /// everything stays aligned row-for-row.
+#[allow(clippy::too_many_lines)]
 fn build_diff_rows(original: &str, optimized: &str) -> Vec<DiffRow> {
     let old_lines: Vec<&str> = original.lines().collect();
     let new_lines: Vec<&str> = optimized.lines().collect();
@@ -797,6 +798,7 @@ fn file_label(path: &str) -> String {
 /// Linearly interpolate between two RGB colors; falls back to `a` for any
 /// non-RGB color (every palette constant above is RGB, so this only ever
 /// takes the fast path in practice).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {
     let Color::Rgb(ar, ag, ab) = a else { return a };
     let Color::Rgb(br, bg, bb) = b else { return a };
@@ -808,6 +810,7 @@ fn lerp_color(a: Color, b: Color, t: f32) -> Color {
 /// A moving highlight sweeping across `text`, the same shimmering-text
 /// effect used while it's working, built from a per-
 /// character sine wave so it needs no extra crate or animation state.
+#[allow(clippy::cast_precision_loss)]
 fn shimmer_spans(text: &str, tick: u64, dim: Color, bright: Color) -> Vec<Span<'static>> {
     text.chars()
         .enumerate()
@@ -824,6 +827,7 @@ fn shimmer_spans(text: &str, tick: u64, dim: Color, bright: Color) -> Vec<Span<'
 
 /// A slow "breathing" pulse between two colors, used on the header icon
 /// so the interface feels alive even when idle.
+#[allow(clippy::cast_precision_loss)]
 fn breathing_color(tick: u64, dim: Color, bright: Color) -> Color {
     let brightness = ((tick as f32) * 0.08).sin().mul_add(0.5, 0.5);
     lerp_color(dim, bright, brightness)

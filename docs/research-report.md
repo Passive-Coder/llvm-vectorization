@@ -172,9 +172,9 @@ Nuzman and Henderson's multi-platform work likewise emphasizes separating a
 target-independent vector IR from target-aware decisions across distinct SIMD
 architectures
 ([Nuzman and Henderson, *Multi-platform Auto-vectorization*](https://doi.org/10.1109/CGO.2006.25),
-CGO 2006). The implication is important here: a fixed 128-bit policy can be a
-useful portable teaching baseline, but it is not a substitute for LLVM's
-`TargetTransformInfo`.
+CGO 2006). The Rust pass now queries LLVM `TargetTransformInfo` for the target's
+fixed-width vector register size. Its remaining per-instruction cost weights
+are still teaching heuristics rather than target scheduling costs.
 
 ### 3.2 What this project's model actually computes
 
@@ -196,8 +196,10 @@ scalar = T * C_s
 vector = C_setup + floor(T / VF) * C_v + (T mod VF) * C_s
 ```
 
-Automatic `VF` starts from a 128-bit register assumption and is the largest
-power of two no greater than `128 / widest_element_bits`. Conservative,
+Automatic `VF` starts from the target's fixed-width vector register size when
+the IR declares a target triple; modules without one retain a 128-bit baseline.
+It is the largest power of two no greater than
+`register_bits / widest_element_bits`. Conservative,
 balanced, and aggressive profiles require minimum trip counts of `4*VF`,
 `2*VF`, and `VF`, respectively, and estimated scalar/vector cost ratios of at
 least 1.25, 1.08, and 1.00. Forced widths bypass the profitability ratio but not
@@ -392,8 +394,37 @@ seeded data/trip variation, and UBSan run cover a bounded set of structures.
 | Plan before mutating. | Candidate validation and one profitability plan complete before the IR rewriter runs. | No persistent VPlan, alternative graph, rollback system, or post-plan re-legalization. |
 | Keep “do nothing” available. | Unprofitable, short, unsupported, or uncertain loops are left scalar with a reason in report mode. | Forced-VF modes intentionally override only the cost decision for experiments. |
 | Tail behavior is part of the plan. | Full-vector trip count is rounded down; the original loop executes the scalar remainder. | No masked/predicated tail or epilogue vectorization. |
-| Cost predictions need empirical calibration. | Three explicit policies and a benchmark protocol make the assumptions inspectable. | No `TargetTransformInfo`, instruction latency/throughput, code-size, register-pressure, or cache model. |
+| Cost predictions need empirical calibration. | Three explicit policies, target register width from TTI, and a benchmark protocol make assumptions inspectable. | No TTI instruction latency/throughput, code-size, register-pressure, or cache model. |
 | Validation needs independent layers. | Unit, fixture, verifier, guard-page, generated differential/UBSan, and controlled benchmark checks cover the supported subset. | No translation-validation proof, property-based structural fuzzing, working ASan result, or multi-target CI result yet. |
+
+### 6.1 Project ingestion and language boundary
+
+LLVM's pass interface consumes modules, so source language support depends on
+frontends that can emit LLVM IR compatible with the LLVM 21 `opt` loading this
+plugin. [Clang documents `-emit-llvm`](https://clang.llvm.org/docs/Toolchain.html),
+[rustc documents `--emit=llvm-ir`](https://doc.rust-lang.org/rustc/command-line-arguments.html),
+[Flang documents `-emit-llvm`](https://releases.llvm.org/21.1.0/tools/flang/docs/FlangCommandLineReference.html),
+and [Swift documents `-emit-ir`](https://github.com/swiftlang/swift/blob/main/docs/DebuggingTheCompiler.md).
+Those interfaces motivate the built-in adapters. The explicit argv-based
+frontend configuration extends ingestion to any compiler that can emit
+compatible IR without pretending arbitrary data files are code.
+
+The driver preserves one module per translation unit, reports both failures
+and skips, and writes only after `opt` and its verifier succeed. In particular,
+it rejects output symlinks, input/output aliases, and unmarked existing source
+directories used as nested output roots. These checks address concrete
+filesystem overwrite paths introduced by directory processing. Frontend
+configuration is opt-in because invoking an arbitrary compiler command from a
+repository by default would add an execution surface.
+
+The CLI now reads Clang's [JSON compilation database](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
+`arguments` entries, preserving working directories and semantic build flags
+while calling LLVM 21 Clang directly. `command`-only entries are rejected
+instead of shell-interpreted. An IR manifest connects native builds in other
+languages to the same project pipeline. Response files bypass the incremental
+cache because their transitive contents are not yet part of a verified cache
+key. These ingestion changes do not widen the Rust pass's legality contract;
+`--engine hybrid` delegates broader shapes to LLVM's own Loop Vectorizer.
 
 ## 7. Present limitations and research roadmap
 
@@ -411,8 +442,8 @@ The highest-value extensions, in risk order, are:
 2. **LLVM analysis integration.** Consume `LoopInfo`, `ScalarEvolution`, alias
    results, and/or `LoopAccessAnalysis` through a narrow C++ bridge. Add guarded
    run-time disambiguation with an explicit scalar fallback.
-3. **Target-aware multi-plan search.** Query `TargetTransformInfo`; compare
-   multiple `VF`/interleave candidates, code-size objectives, scalarization,
+3. **Target-aware multi-plan search.** Extend the current TTI register-width
+   query to compare multiple `VF`/interleave candidates, code-size objectives, scalarization,
    setup, and remainder strategies; retain the scalar plan.
 4. **Richer legal constructs.** Model reductions, live-outs, multiple blocks,
    if-conversion, calls with vector mappings, and predicated memory without
@@ -447,6 +478,11 @@ scope being silently generalized to another.
 | [LLVM, *Vectorization Plan*](https://llvm.org/docs/VectorizationPlan.html) | living documentation | Legal → Plan → Execute; only execution mutates IR; plan represents alternatives. | Describes LLVM's evolving VPlan architecture. |
 | [LLVM, `LoopAccessAnalysis`](https://github.com/llvm/llvm-project/blob/main/llvm/include/llvm/Analysis/LoopAccessAnalysis.h) | current `main` | Production memory-dependence reasoning can use SCEV/AA and run-time checks. | A moving implementation reference, not a stable API contract. |
 | [LLVM, *Auto-Vectorization in LLVM*](https://llvm.org/docs/Vectorizers.html) | living documentation | Scalar remainders, run-time pointer checks, reductions, and other production features. | Feature overview; details vary by target and LLVM version. |
+| [Clang, *Assembling a Complete Toolchain*](https://clang.llvm.org/docs/Toolchain.html) | living documentation | `-emit-llvm` exposes source-to-IR compilation for the Clang family. | Language-specific compilation options still matter. |
+| [rustc, *Command-line Arguments*](https://doc.rust-lang.org/rustc/command-line-arguments.html) | living documentation | `--emit=llvm-ir` can write IR to a chosen path. | Standalone `rustc` is not a replacement for a Cargo dependency build. |
+| [Flang 21, *Command line argument reference*](https://releases.llvm.org/21.1.0/tools/flang/docs/FlangCommandLineReference.html) | 2025 | `-emit-llvm` and `-S` expose textual LLVM IR. | The Flang driver was unavailable for local runtime testing. |
+| [Swift, *Debugging the Compiler*](https://github.com/swiftlang/swift/blob/main/docs/DebuggingTheCompiler.md) | current `main` | `swiftc -emit-ir -O` exposes LLVM IR. | A single-file invocation may not represent a multi-file Swift module. |
+| [Clang, *JSON Compilation Database Format*](https://clang.llvm.org/docs/JSONCompilationDatabase.html) | living documentation | Build metadata records arguments and working directories per translation unit. | The CLI reads `arguments` entries and rejects `command` strings. |
 | [Nuzman & Henderson, *Multi-platform Auto-vectorization*](https://doi.org/10.1109/CGO.2006.25) | 2006 | Target-neutral vector IR must be paired with platform-sensitive profitability. | Historical architecture study. |
 | [Porpodas & Jones, *Throttling Automatic Vectorization*](https://doi.org/10.1109/PACT.2015.32) | 2015 | Less aggressive SLP graph formation can outperform full greedy packing. | SLP, evaluated kernels, and paper platform—not this loop pass. |
 | [Pohl, Cosenza & Juurlink, *Vectorization Cost Modeling for NEON, AVX and SVE*](https://doi.org/10.1016/j.peva.2020.102106) | 2020 | Compiler cost estimates can correlate poorly with measured gains; richer target-calibrated features improve prediction in the study. | Results are tied to its targets, corpus, and fitted model. |

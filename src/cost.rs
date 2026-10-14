@@ -18,17 +18,34 @@ pub(crate) struct Plan {
     pub(crate) vector_coverage_x100: u64,
 }
 
+#[cfg(test)]
 pub(crate) fn choose_plan(
     config: PassConfig,
     element_bits: u32,
     estimated_trip_count: u64,
     costs: LoopCosts,
 ) -> Option<Plan> {
+    choose_plan_with_vector_bits(
+        config,
+        element_bits,
+        estimated_trip_count,
+        costs,
+        PassConfig::vector_bits(),
+    )
+}
+
+pub(crate) fn choose_plan_with_vector_bits(
+    config: PassConfig,
+    element_bits: u32,
+    estimated_trip_count: u64,
+    costs: LoopCosts,
+    vector_bits: u32,
+) -> Option<Plan> {
     if element_bits == 0 || estimated_trip_count == 0 || costs.scalar_iteration == 0 {
         return None;
     }
 
-    let available_lanes = PassConfig::vector_bits().checked_div(element_bits)?.max(1);
+    let available_lanes = vector_bits.checked_div(element_bits)?.max(1);
     let natural_vf = 1_u32.checked_shl(available_lanes.ilog2()).unwrap_or(1);
     let candidate_vf = config.forced_vf.unwrap_or(natural_vf);
     if candidate_vf < 2 || !candidate_vf.is_power_of_two() || candidate_vf > 64 {
@@ -170,5 +187,17 @@ mod tests {
         )
         .expect("two full vector iterations are profitable");
         assert_eq!(plan.vector_coverage_x100, 80);
+    }
+
+    #[test]
+    fn target_vector_register_width_changes_automatic_vf() {
+        let costs = LoopCosts {
+            scalar_iteration: 8,
+            vector_iteration: 8,
+            setup: 6,
+        };
+        let plan = choose_plan_with_vector_bits(config(Heuristic::Balanced), 32, 64, costs, 256)
+            .expect("eight f32 lanes should be profitable on 256-bit vectors");
+        assert_eq!(plan.vf, 8);
     }
 }

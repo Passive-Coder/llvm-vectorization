@@ -8,7 +8,7 @@ use std::ffi::{CStr, c_void};
 use llvm_sys::core::{
     LLVMCountBasicBlocks, LLVMGetBasicBlockName, LLVMGetFirstBasicBlock, LLVMGetFirstFunction,
     LLVMGetFirstInstruction, LLVMGetNextBasicBlock, LLVMGetNextFunction, LLVMGetNextInstruction,
-    LLVMGetValueName2,
+    LLVMGetTarget, LLVMGetValueName2,
 };
 use llvm_sys::prelude::{LLVMBasicBlockRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
 
@@ -22,6 +22,19 @@ unsafe extern "C" {
         element_type: *mut c_void,
         vector_factor: u32,
     ) -> bool;
+    fn rv_target_vector_bits(function_analyses: *mut c_void, function: *mut c_void) -> u32;
+}
+
+pub(crate) fn target_vector_bits(function_analyses: *mut c_void, function: LLVMValueRef) -> u32 {
+    // SAFETY: the module adapter passes a live function analysis manager and a
+    // function from its module; the bridge only queries TargetIRAnalysis.
+    unsafe { rv_target_vector_bits(function_analyses, function.cast()) }
+}
+
+pub(crate) fn module_has_target(module: LLVMModuleRef) -> bool {
+    // SAFETY: module is live and LLVM owns the null-terminated target string.
+    let target = unsafe { LLVMGetTarget(module) };
+    !target.is_null() && !unsafe { CStr::from_ptr(target) }.to_bytes().is_empty()
 }
 
 pub(crate) fn loop_vectorization_disabled(instruction: LLVMValueRef) -> bool {

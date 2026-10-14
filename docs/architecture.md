@@ -16,13 +16,29 @@ The major files are:
 
 | File | Responsibility |
 |---|---|
-| [`native/pass_plugin.cpp`](../native/pass_plugin.cpp) | New PM registration; pass-name parsing; C++ bridges for module wrapping, PHI incoming-block updates, loop metadata, and `DataLayout` checks. |
+| [`native/pass_plugin.cpp`](../native/pass_plugin.cpp) | New PM registration; pass-name parsing; C++ bridges for module wrapping, PHI incoming-block updates, loop metadata, `DataLayout`, and target register width. |
 | [`src/lib.rs`](../src/lib.rs) | Dynamic-plugin ABI, FFI configuration, panic containment, and hand-off to the Rust pass. |
 | [`src/vectorizer.rs`](../src/vectorizer.rs) | Candidate discovery, complete legality preflight, cost input collection, IR widening, scalar-tail construction, and remarks. |
 | [`src/dependence.rs`](../src/dependence.rs) | Pure Rust affine-pair classification and unit tests. |
 | [`src/cost.rs`](../src/cost.rs) | Vector-factor selection, trip thresholds, scalar/vector score, and estimated vector coverage. |
 | [`src/config.rs`](../src/config.rs) | Conservative, balanced, aggressive, and forced-width policies. |
 | [`src/llvm.rs`](../src/llvm.rs) | Narrow wrappers around borrowed LLVM handles and C++ bridge functions. |
+| [`src/bin/rv-vectorize/project.rs`](../src/bin/rv-vectorize/project.rs) | Project traversal, source frontend adapters, output isolation, and per-file orchestration. |
+| [`src/bin/rv-vectorize/inputs.rs`](../src/bin/rv-vectorize/inputs.rs) | Compilation database and language-independent IR manifest ingestion. |
+| [`src/bin/rv-vectorize/report.rs`](../src/bin/rv-vectorize/report.rs) | Versioned per-file and per-loop JSON records. |
+| [`src/bin/rv-vectorize/cache.rs`](../src/bin/rv-vectorize/cache.rs) | Content-keyed incremental artifacts. |
+| [`src/bin/rv-vectorize/process.rs`](../src/bin/rv-vectorize/process.rs) | Captured subprocess execution and resource limits. |
+
+The CLI accepts a single module or a project directory. A directory is scanned
+for LLVM modules and supported source translation units; each source frontend
+emits temporary LLVM IR, then the same module pass and verifier process it.
+Outputs mirror the input tree but remain separate modules. Build metadata or an
+IR manifest can supply exact per-unit inputs. Object output maps those modules
+to linkable files; language-specific linking and cross-module optimization
+remain the responsibility of their native build systems. `--engine hybrid`
+adds LLVM's production Loop Vectorizer after the Rust pass for broader loop
+coverage; its transformations are LLVM's, while the Rust pass keeps the bounded
+contract documented below.
 
 ## 2. End-to-end pipeline
 
@@ -207,10 +223,14 @@ stage.
 
 ### 5.1 Vector factor
 
-The automatic policy assumes 128 vector bits. Let `W` be the largest bit width
+The automatic policy queries the target's fixed-width vector register size
+through LLVM `TargetTransformInfo` when a target triple is present. Modules
+without a target triple retain the 128-bit baseline used by the checked-in IR
+fixtures. Let `W` be the largest bit width
 seen among memory elements and compute inputs/results (casts account for both
-ends). The natural width is the largest power of two not exceeding `128 / W`.
-Therefore the usual choices are:
+ends), and `R` the target register size or the 128-bit fallback. The natural
+width is the largest power of two not exceeding `R / W`. At `R = 128`, the
+usual choices are:
 
 | Widest scalar width | Natural VF |
 |---:|---:|
@@ -222,9 +242,9 @@ Therefore the usual choices are:
 Widths below two lanes, non-power-of-two forced widths, and forced widths above
 64 reject at planning. Public pass names expose forced widths through 16.
 
-This is a fixed-width IR policy. It does not query register widths, legal vector
-types, instruction throughput, or lowering cost from `TargetTransformInfo`, and
-it does not generate scalable vectors.
+This remains a fixed-width IR policy. Register width alone does not account for
+legal vector instruction types, throughput, or lowering cost; those richer TTI
+queries and scalable vectors remain outside the Rust cost model.
 
 ### 5.2 Cost equation and policy profiles
 

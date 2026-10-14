@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_char;
+use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
@@ -22,16 +23,18 @@ use llvm_sys::core::{
     LLVMBuildLoad2, LLVMBuildPhi, LLVMBuildSelect, LLVMBuildShuffleVector, LLVMBuildStore,
     LLVMCanValueUseFastMathFlags, LLVMConstInt, LLVMConstIntGetSExtValue, LLVMConstIntGetZExtValue,
     LLVMConstVector, LLVMCountIncoming, LLVMCreateBuilderInContext, LLVMDisposeBuilder,
-    LLVMGetAlignment, LLVMGetBasicBlockTerminator, LLVMGetCondition, LLVMGetEnumAttributeAtIndex,
-    LLVMGetEnumAttributeKindForName, LLVMGetExact, LLVMGetFCmpPredicate, LLVMGetFastMathFlags,
-    LLVMGetFirstParam, LLVMGetFirstUse, LLVMGetGEPSourceElementType, LLVMGetICmpPredicate,
-    LLVMGetIncomingBlock, LLVMGetIncomingValue, LLVMGetInstructionOpcode, LLVMGetInstructionParent,
-    LLVMGetIntTypeWidth, LLVMGetModuleContext, LLVMGetNSW, LLVMGetNUW, LLVMGetNextParam,
-    LLVMGetNextUse, LLVMGetNumOperands, LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetPoison,
-    LLVMGetSuccessor, LLVMGetTypeContext, LLVMGetTypeKind, LLVMGetUser, LLVMGetVolatile,
-    LLVMInsertBasicBlockInContext, LLVMInt32TypeInContext, LLVMIsAArgument, LLVMIsAConstantInt,
-    LLVMIsAGetElementPtrInst, LLVMIsAGlobalVariable, LLVMIsAInstruction, LLVMIsAtomic,
-    LLVMIsInBounds, LLVMPositionBuilderAtEnd, LLVMSetAlignment, LLVMSetExact, LLVMSetFastMathFlags,
+    LLVMGetAlignment, LLVMGetBasicBlockTerminator, LLVMGetCondition, LLVMGetDebugLocColumn,
+    LLVMGetDebugLocDirectory, LLVMGetDebugLocFilename, LLVMGetDebugLocLine,
+    LLVMGetEnumAttributeAtIndex, LLVMGetEnumAttributeKindForName, LLVMGetExact,
+    LLVMGetFCmpPredicate, LLVMGetFastMathFlags, LLVMGetFirstParam, LLVMGetFirstUse,
+    LLVMGetGEPSourceElementType, LLVMGetICmpPredicate, LLVMGetIncomingBlock, LLVMGetIncomingValue,
+    LLVMGetInstructionOpcode, LLVMGetInstructionParent, LLVMGetIntTypeWidth, LLVMGetModuleContext,
+    LLVMGetNSW, LLVMGetNUW, LLVMGetNextParam, LLVMGetNextUse, LLVMGetNumOperands,
+    LLVMGetNumSuccessors, LLVMGetOperand, LLVMGetPoison, LLVMGetSuccessor, LLVMGetTypeContext,
+    LLVMGetTypeKind, LLVMGetUser, LLVMGetVolatile, LLVMInsertBasicBlockInContext,
+    LLVMInt32TypeInContext, LLVMIsAArgument, LLVMIsAConstantInt, LLVMIsAGetElementPtrInst,
+    LLVMIsAGlobalVariable, LLVMIsAInstruction, LLVMIsAtomic, LLVMIsInBounds,
+    LLVMPositionBuilderAtEnd, LLVMSetAlignment, LLVMSetExact, LLVMSetFastMathFlags,
     LLVMSetIsInBounds, LLVMSetNSW, LLVMSetNUW, LLVMSetSuccessor, LLVMTypeOf, LLVMVectorType,
 };
 use llvm_sys::prelude::{
@@ -40,7 +43,7 @@ use llvm_sys::prelude::{
 use llvm_sys::{LLVMAttributeFunctionIndex, LLVMOpcode};
 
 use crate::config::PassConfig;
-use crate::cost::{LoopCosts, Plan, choose_plan};
+use crate::cost::{LoopCosts, Plan, choose_plan_with_vector_bits};
 use crate::dependence::{AccessKind, AffineAccess, Dependence, classify};
 use crate::llvm;
 use crate::mark_ir_mutated;
@@ -96,7 +99,11 @@ impl Drop for Builder {
     }
 }
 
-pub(crate) fn run(module: LLVMModuleRef, config: PassConfig) -> bool {
+pub(crate) fn run(
+    module: LLVMModuleRef,
+    config: PassConfig,
+    function_analyses: *mut c_void,
+) -> bool {
     let mut changed = false;
     let functions = llvm::functions(module);
 
@@ -105,9 +112,20 @@ pub(crate) fn run(module: LLVMModuleRef, config: PassConfig) -> bool {
             continue;
         }
         let headers = discover_single_block_loop_headers(function);
+        if headers.is_empty() {
+            continue;
+        }
+        let vector_bits = if llvm::module_has_target(module) {
+            llvm::target_vector_bits(function_analyses, function)
+        } else {
+            // Fixtures and hand-written IR without a target retain the
+            // historical portable baseline; a specified scalar target does
+            // not get an invented vector width.
+            PassConfig::vector_bits()
+        };
         for header in headers {
             let analysis_start = Instant::now();
-            let analysis = analyze_candidate(module, function, header, config);
+            let analysis = analyze_candidate(module, function, header, config, vector_bits);
             let analysis_time = analysis_start.elapsed();
 
             match analysis {
@@ -174,6 +192,7 @@ fn analyze_candidate(
     function: LLVMValueRef,
     header: LLVMBasicBlockRef,
     config: PassConfig,
+    vector_bits: u32,
 ) -> Result<(Candidate, Plan), Rejection> {
     let body = llvm::instructions(header);
     if body.len() > MAX_BODY_INSTRUCTIONS {
@@ -308,8 +327,14 @@ fn analyze_candidate(
         vector_iteration: vector_cost,
         setup: 6,
     };
-    let plan = choose_plan(config, widest_element_bits, estimated_trip_count, costs)
-        .ok_or(Rejection("not-profitable"))?;
+    let plan = choose_plan_with_vector_bits(
+        config,
+        widest_element_bits,
+        estimated_trip_count,
+        costs,
+        vector_bits,
+    )
+    .ok_or(Rejection("not-profitable"))?;
     if memory.iter().any(|access| {
         !llvm::vector_memory_layout_is_packed(module, access.base, access.element_type, plan.vf)
     }) {
@@ -1609,8 +1634,14 @@ fn report(
 ) {
     let (vf, vector_coverage, issued_lane_utilization) =
         plan.map_or((0, 0, 0), |plan| (plan.vf, plan.vector_coverage_x100, 100));
+    let terminator = unsafe { LLVMGetBasicBlockTerminator(header) };
+    let location = if terminator.is_null() {
+        String::new()
+    } else {
+        debug_location(terminator)
+    };
     eprintln!(
-        "rv-vectorize: function={} loop={} decision={} reason={} vf={} estimated_vector_coverage={}% issued_lane_utilization={}% analysis_us={:.3} transform_us={:.3}",
+        "rv-vectorize: function={} loop={} decision={} reason={} vf={} estimated_vector_coverage={}% issued_lane_utilization={}% analysis_us={:.3} transform_us={:.3}{}",
         report_atom(&llvm::value_name(function)),
         report_atom(&llvm::block_name(header)),
         decision,
@@ -1620,7 +1651,42 @@ fn report(
         issued_lane_utilization,
         duration_micros(analysis),
         duration_micros(transform),
+        location,
     );
+}
+
+fn debug_location(instruction: LLVMValueRef) -> String {
+    // SAFETY: `instruction` is live for the duration of this pass invocation.
+    let line = unsafe { LLVMGetDebugLocLine(instruction) };
+    if line == 0 {
+        return String::new();
+    }
+    let mut file_length = 0;
+    let mut directory_length = 0;
+    // SAFETY: LLVM owns these buffers while the instruction is live.
+    let file = unsafe { LLVMGetDebugLocFilename(instruction, &raw mut file_length) };
+    let directory = unsafe { LLVMGetDebugLocDirectory(instruction, &raw mut directory_length) };
+    if file.is_null() || file_length == 0 {
+        return String::new();
+    }
+    // SAFETY: LLVM returned non-null pointers and their exact buffer lengths.
+    let file = unsafe { std::slice::from_raw_parts(file.cast::<u8>(), file_length as usize) };
+    let file = String::from_utf8_lossy(file);
+    let path = if directory.is_null() || directory_length == 0 {
+        file.into_owned()
+    } else {
+        // SAFETY: LLVM returned a non-null pointer and its exact buffer length.
+        let directory = unsafe {
+            std::slice::from_raw_parts(directory.cast::<u8>(), directory_length as usize)
+        };
+        format!("{}/{}", String::from_utf8_lossy(directory), file)
+    };
+    // SAFETY: `instruction` is live.
+    let column = unsafe { LLVMGetDebugLocColumn(instruction) };
+    format!(
+        " source_file={} source_line={line} source_column={column}",
+        report_atom(&path)
+    )
 }
 
 fn duration_micros(duration: Duration) -> f64 {

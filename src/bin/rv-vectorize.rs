@@ -4,21 +4,63 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+#[path = "rv-vectorize/cache.rs"]
+mod cache;
+#[path = "rv-vectorize/compare.rs"]
+mod compare;
+#[path = "rv-vectorize/doctor.rs"]
+mod doctor;
+#[path = "rv-vectorize/inputs.rs"]
+mod inputs;
+#[path = "rv-vectorize/process.rs"]
+mod process;
+#[path = "rv-vectorize/project.rs"]
+mod project;
+#[path = "rv-vectorize/report.rs"]
+mod report;
+
 const HELP: &str = r"rv-vectorize - run the Rust LLVM loop-vectorization pass
 
 USAGE:
-    rv-vectorize [OPTIONS] <INPUT.ll|INPUT.bc>
+    rv-vectorize [OPTIONS] <INPUT.ll|INPUT.bc|SOURCE_FILE|PROJECT_DIR>
 
 OPTIONS:
-    -o, --output <PATH>       Output path (default: stdout)
+    -o, --output <PATH>       Output file, or output directory for project mode
+        --frontend-config <PATH>
+                            JSON extension-to-argv map for additional LLVM frontends
+        --compile-commands <PATH>
+                            Clang JSON compilation database (arguments entries)
+        --input-manifest <PATH>
+                            JSON list of project source identities and emitted LLVM IR
+        --include <GLOB>      Select matching project paths (repeatable)
+        --exclude <GLOB>      Exclude matching project paths (repeatable)
+        --no-gitignore        Ignore .gitignore rules while scanning
+        --explain-skips       Print why project paths are skipped
+        --jobs <N>            Process up to N modules concurrently
+        --cache-dir <PATH>    Reuse verified artifacts when inputs match
+        --timeout-seconds <N> Kill a subprocess after N seconds
+        --max-memory-mib <N>  Limit subprocess memory usage
+        --max-input-bytes <N> Reject larger source or IR files
+        --compare-config <PATH>
+                            Compare explicit baseline and candidate programs
         --policy <POLICY>     balanced, conservative, or aggressive
         --vf <WIDTH>          auto, 2, 4, 8, or 16
+        --engine <ENGINE>     rust, hybrid, or llvm
+        --target-triple <TRIPLE>
+                            LLVM target triple override
+        --cpu <CPU>           LLVM target CPU for planning and object emission
+        --features <FEATURES>
+                            LLVM target feature list, e.g. +avx2,-avx512f
         --report              Print per-loop decisions to stderr
+        --report-json <PATH>  Write per-file and per-loop results as JSON
+        --fail-on-missed <N>  Fail when rejected candidate loops exceed N
         --emit-bitcode        Emit LLVM bitcode instead of textual IR
+        --emit-object         Emit linkable native object files
         --no-verify           Do not run LLVM's verifier after the pass
         --llvm-prefix <PATH>  LLVM 21 installation prefix
         --opt <PATH>          Path to LLVM 21 opt
         --plugin <PATH>       Path to the vectorizer pass plugin
+        --doctor              Check LLVM 21 tools and plugin loading
         --dry-run             Print the resolved opt command without running it
     -h, --help                Print help
     -V, --version             Print version
@@ -28,8 +70,9 @@ ENVIRONMENT:
     LLVM_CONFIG_PATH         Path to llvm-config (its sibling opt is used)
     RV_PLUGIN_PATH           Path to the vectorizer pass plugin
 
-The input must be LLVM IR or bitcode. To compile C first:
-    clang -O1 -S -emit-llvm -fno-vectorize -fno-slp-vectorize input.c -o input.ll
+Directories are scanned recursively. LLVM IR/bitcode and recognized source
+languages are emitted as separate LLVM modules under the output directory.
+Other files are skipped. The compiler frontends must emit LLVM 21-compatible IR.
 ";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -68,6 +111,35 @@ enum VectorWidth {
     Fixed(u8),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Engine {
+    #[default]
+    Rust,
+    Hybrid,
+    Llvm,
+}
+
+impl Engine {
+    fn parse(value: &OsStr) -> Result<Self, String> {
+        match value.to_str() {
+            Some("rust") => Ok(Self::Rust),
+            Some("hybrid") => Ok(Self::Hybrid),
+            Some("llvm") => Ok(Self::Llvm),
+            _ => Err(format!(
+                "invalid engine {value:?}; expected rust, hybrid, or llvm"
+            )),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Hybrid => "hybrid",
+            Self::Llvm => "llvm",
+        }
+    }
+}
+
 impl VectorWidth {
     fn parse(value: &OsStr) -> Result<Self, String> {
         match value.to_str() {
@@ -90,17 +162,38 @@ struct Options {
     output: Option<PathBuf>,
     policy: Policy,
     vector_width: VectorWidth,
+    engine: Engine,
+    target_triple: Option<String>,
+    cpu: Option<String>,
+    features: Option<String>,
     report: bool,
+    report_json: Option<PathBuf>,
+    fail_on_missed: Option<usize>,
     emit_bitcode: bool,
+    emit_object: bool,
     verify: bool,
     llvm_prefix: Option<PathBuf>,
     opt: Option<PathBuf>,
     plugin: Option<PathBuf>,
+    frontend_config: Option<PathBuf>,
+    compile_commands: Option<PathBuf>,
+    input_manifest: Option<PathBuf>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+    no_gitignore: bool,
+    explain_skips: bool,
+    doctor: bool,
+    jobs: usize,
+    cache_dir: Option<PathBuf>,
+    timeout_seconds: Option<u64>,
+    max_memory_mib: Option<u64>,
+    max_input_bytes: Option<u64>,
+    compare_config: Option<PathBuf>,
     dry_run: bool,
 }
 
 enum Parsed {
-    Run(Options),
+    Run(Box<Options>),
     Help,
     Version,
 }
@@ -121,9 +214,28 @@ fn set_input(input: &mut Option<PathBuf>, value: &OsStr) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_positive(value: &OsStr, option: &str) -> Result<u64, String> {
+    let number: u64 = value
+        .to_str()
+        .ok_or_else(|| format!("{option} needs a positive integer"))?
+        .parse()
+        .map_err(|_| format!("{option} needs a positive integer"))?;
+    if number == 0 {
+        return Err(format!("{option} needs a positive integer"));
+    }
+    Ok(number)
+}
+
+fn parse_jobs(value: &OsStr) -> Result<usize, String> {
+    let value = parse_positive(value, "--jobs")?;
+    usize::try_from(value).map_err(|_| "--jobs is too large".to_owned())
+}
+
+#[allow(clippy::too_many_lines)]
 fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
     let mut options = Options {
         verify: true,
+        jobs: 1,
         ..Options::default()
     };
     let mut index = 0;
@@ -151,6 +263,26 @@ fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
             options.policy = Policy::parse(&take_value(arguments, &mut index, "--policy")?)?;
         } else if text == Some("--vf") {
             options.vector_width = VectorWidth::parse(&take_value(arguments, &mut index, "--vf")?)?;
+        } else if text == Some("--engine") {
+            options.engine = Engine::parse(&take_value(arguments, &mut index, "--engine")?)?;
+        } else if text == Some("--target-triple") {
+            options.target_triple = Some(
+                take_value(arguments, &mut index, "--target-triple")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else if text == Some("--cpu") {
+            options.cpu = Some(
+                take_value(arguments, &mut index, "--cpu")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else if text == Some("--features") {
+            options.features = Some(
+                take_value(arguments, &mut index, "--features")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         } else if text == Some("--llvm-prefix") {
             options.llvm_prefix = Some(PathBuf::from(take_value(
                 arguments,
@@ -163,10 +295,91 @@ fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
             options.plugin = Some(PathBuf::from(take_value(
                 arguments, &mut index, "--plugin",
             )?));
+        } else if text == Some("--frontend-config") {
+            options.frontend_config = Some(PathBuf::from(take_value(
+                arguments,
+                &mut index,
+                "--frontend-config",
+            )?));
+        } else if text == Some("--compile-commands") {
+            options.compile_commands = Some(PathBuf::from(take_value(
+                arguments,
+                &mut index,
+                "--compile-commands",
+            )?));
+        } else if text == Some("--input-manifest") {
+            options.input_manifest = Some(PathBuf::from(take_value(
+                arguments,
+                &mut index,
+                "--input-manifest",
+            )?));
+        } else if text == Some("--include") {
+            options.include.push(
+                take_value(arguments, &mut index, "--include")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else if text == Some("--exclude") {
+            options.exclude.push(
+                take_value(arguments, &mut index, "--exclude")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        } else if text == Some("--no-gitignore") {
+            options.no_gitignore = true;
+        } else if text == Some("--explain-skips") {
+            options.explain_skips = true;
+        } else if text == Some("--doctor") {
+            options.doctor = true;
+        } else if text == Some("--jobs") {
+            options.jobs = parse_jobs(&take_value(arguments, &mut index, "--jobs")?)?;
+        } else if text == Some("--cache-dir") {
+            options.cache_dir = Some(PathBuf::from(take_value(
+                arguments,
+                &mut index,
+                "--cache-dir",
+            )?));
+        } else if text == Some("--timeout-seconds") {
+            options.timeout_seconds = Some(parse_positive(
+                &take_value(arguments, &mut index, "--timeout-seconds")?,
+                "--timeout-seconds",
+            )?);
+        } else if text == Some("--max-memory-mib") {
+            options.max_memory_mib = Some(parse_positive(
+                &take_value(arguments, &mut index, "--max-memory-mib")?,
+                "--max-memory-mib",
+            )?);
+        } else if text == Some("--max-input-bytes") {
+            options.max_input_bytes = Some(parse_positive(
+                &take_value(arguments, &mut index, "--max-input-bytes")?,
+                "--max-input-bytes",
+            )?);
+        } else if text == Some("--compare-config") {
+            options.compare_config = Some(PathBuf::from(take_value(
+                arguments,
+                &mut index,
+                "--compare-config",
+            )?));
         } else if text == Some("--report") {
             options.report = true;
+        } else if text == Some("--report-json") {
+            options.report_json = Some(PathBuf::from(take_value(
+                arguments,
+                &mut index,
+                "--report-json",
+            )?));
+        } else if text == Some("--fail-on-missed") {
+            let value = take_value(arguments, &mut index, "--fail-on-missed")?;
+            options.fail_on_missed = Some(
+                value
+                    .to_string_lossy()
+                    .parse()
+                    .map_err(|_| "--fail-on-missed needs a nonnegative integer".to_owned())?,
+            );
         } else if text == Some("--emit-bitcode") {
             options.emit_bitcode = true;
+        } else if text == Some("--emit-object") {
+            options.emit_object = true;
         } else if text == Some("--no-verify") {
             options.verify = false;
         } else if text == Some("--dry-run") {
@@ -177,12 +390,54 @@ fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
             options.policy = Policy::parse(OsStr::new(value))?;
         } else if let Some(value) = text.and_then(|value| value.strip_prefix("--vf=")) {
             options.vector_width = VectorWidth::parse(OsStr::new(value))?;
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--engine=")) {
+            options.engine = Engine::parse(OsStr::new(value))?;
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--target-triple=")) {
+            options.target_triple = Some(value.to_owned());
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--cpu=")) {
+            options.cpu = Some(value.to_owned());
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--features=")) {
+            options.features = Some(value.to_owned());
         } else if let Some(value) = text.and_then(|value| value.strip_prefix("--llvm-prefix=")) {
             options.llvm_prefix = Some(PathBuf::from(value));
         } else if let Some(value) = text.and_then(|value| value.strip_prefix("--opt=")) {
             options.opt = Some(PathBuf::from(value));
         } else if let Some(value) = text.and_then(|value| value.strip_prefix("--plugin=")) {
             options.plugin = Some(PathBuf::from(value));
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--frontend-config="))
+        {
+            options.frontend_config = Some(PathBuf::from(value));
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--compile-commands="))
+        {
+            options.compile_commands = Some(PathBuf::from(value));
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--input-manifest=")) {
+            options.input_manifest = Some(PathBuf::from(value));
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--report-json=")) {
+            options.report_json = Some(PathBuf::from(value));
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--fail-on-missed=")) {
+            options.fail_on_missed = Some(
+                value
+                    .parse()
+                    .map_err(|_| "--fail-on-missed needs a nonnegative integer".to_owned())?,
+            );
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--include=")) {
+            options.include.push(value.to_owned());
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--exclude=")) {
+            options.exclude.push(value.to_owned());
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--jobs=")) {
+            options.jobs = parse_jobs(OsStr::new(value))?;
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--cache-dir=")) {
+            options.cache_dir = Some(PathBuf::from(value));
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--timeout-seconds="))
+        {
+            options.timeout_seconds = Some(parse_positive(OsStr::new(value), "--timeout-seconds")?);
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--max-memory-mib=")) {
+            options.max_memory_mib = Some(parse_positive(OsStr::new(value), "--max-memory-mib")?);
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--max-input-bytes="))
+        {
+            options.max_input_bytes = Some(parse_positive(OsStr::new(value), "--max-input-bytes")?);
+        } else if let Some(value) = text.and_then(|value| value.strip_prefix("--compare-config=")) {
+            options.compare_config = Some(PathBuf::from(value));
         } else if text.is_some_and(|value| value.starts_with('-')) {
             return Err(format!("unknown option {argument:?}"));
         } else {
@@ -191,18 +446,62 @@ fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
         index += 1;
     }
 
-    if options.input.is_none() {
-        return Err("missing input LLVM IR or bitcode file".to_owned());
+    if options.input.is_none() && !options.doctor {
+        return Err("missing input LLVM IR, bitcode, or project directory".to_owned());
+    }
+    if options.emit_bitcode && options.emit_object {
+        return Err("--emit-bitcode and --emit-object cannot be combined".to_owned());
+    }
+    if options.jobs > 256 {
+        return Err("--jobs must be at most 256".to_owned());
+    }
+    if options.emit_object && options.output.is_none() {
+        return Err("--emit-object requires -o/--output".to_owned());
+    }
+    if options.dry_run && (options.report_json.is_some() || options.fail_on_missed.is_some()) {
+        return Err("report and missed-loop gates require a real run".to_owned());
+    }
+    if options.dry_run && options.compare_config.is_some() {
+        return Err("--compare-config requires a real run".to_owned());
+    }
+    if options.input.as_ref().is_some_and(|input| input.is_file())
+        && (options.compile_commands.is_some()
+            || options.input_manifest.is_some()
+            || !options.include.is_empty()
+            || !options.exclude.is_empty()
+            || options.no_gitignore
+            || options.explain_skips
+            || options.jobs != 1
+            || options.cache_dir.is_some())
+    {
+        return Err("project selection, build metadata, jobs, and cache options require a project directory".to_owned());
     }
     if options.policy != Policy::Balanced && options.vector_width != VectorWidth::Auto {
         return Err("--policy and a fixed --vf cannot be combined".to_owned());
+    }
+    if options.engine != Engine::Rust && options.fail_on_missed.is_some() {
+        return Err("--fail-on-missed currently measures only the Rust engine".to_owned());
+    }
+    if options.engine == Engine::Llvm && options.policy != Policy::Balanced {
+        return Err("--policy applies only when the Rust pass runs".to_owned());
+    }
+    if [
+        options.target_triple.as_deref(),
+        options.cpu.as_deref(),
+        options.features.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(str::is_empty)
+    {
+        return Err("target triple, CPU, and features values must be nonempty".to_owned());
     }
     if let (Some(input), Some(output)) = (&options.input, &options.output) {
         if input == output {
             return Err("input and output paths must differ".to_owned());
         }
     }
-    Ok(Parsed::Run(options))
+    Ok(Parsed::Run(Box::new(options)))
 }
 
 fn pass_pipeline(options: &Options) -> String {
@@ -210,13 +509,20 @@ fn pass_pipeline(options: &Options) -> String {
         VectorWidth::Auto => options.policy.pass_stem().to_owned(),
         VectorWidth::Fixed(width) => format!("rust-loop-vectorize-force-vf{width}"),
     };
-    if options.report {
+    if options.report || options.report_json.is_some() || options.fail_on_missed.is_some() {
         pass.push_str("-report");
     }
-    if options.verify {
-        pass.push_str(",verify");
+    let mut passes = Vec::new();
+    if options.engine != Engine::Llvm {
+        passes.push(pass);
     }
-    pass
+    if options.engine != Engine::Rust {
+        passes.push("function(loop-simplify,loop-vectorize)".to_owned());
+    }
+    if options.verify {
+        passes.push("verify".to_owned());
+    }
+    passes.join(",")
 }
 
 fn llvm_prefix_candidates(options: &Options) -> Vec<PathBuf> {
@@ -349,44 +655,77 @@ fn command_display(command: &Command) -> String {
         .join(" ")
 }
 
-fn build_command(options: &Options, opt: &Path, plugin: &Path) -> Command {
+fn build_command(
+    options: &Options,
+    opt: &Path,
+    plugin: &Path,
+    input: &Path,
+    output: &Path,
+) -> Command {
     let mut command = Command::new(opt);
+    add_target_options(&mut command, options);
+    if options.engine != Engine::Rust {
+        if let VectorWidth::Fixed(width) = options.vector_width {
+            command.arg(format!("-force-vector-width={width}"));
+        }
+        if options.report || options.report_json.is_some() {
+            command.args([
+                "-pass-remarks=loop-vectorize",
+                "-pass-remarks-missed=loop-vectorize",
+                "-pass-remarks-analysis=loop-vectorize",
+            ]);
+        }
+    }
     command.arg(format!("-load-pass-plugin={}", plugin.display()));
     command.arg(format!("-passes={}", pass_pipeline(options)));
-    if !options.emit_bitcode {
+    if !options.emit_bitcode && !options.emit_object {
         command.arg("-S");
     }
-    command.arg(options.input.as_ref().expect("validated input"));
+    command.arg(input);
     command.arg("-o");
-    command.arg(options.output.as_deref().unwrap_or_else(|| Path::new("-")));
+    command.arg(output);
     command
 }
 
+fn add_target_options(command: &mut Command, options: &Options) {
+    if let Some(triple) = &options.target_triple {
+        command.arg(format!("-mtriple={triple}"));
+    }
+    if let Some(cpu) = &options.cpu {
+        command.arg(format!("-mcpu={cpu}"));
+    }
+    if let Some(features) = &options.features {
+        command.arg(format!("-mattr={features}"));
+    }
+}
+
 fn run(options: &Options) -> Result<(), String> {
+    if options.doctor {
+        return doctor::run(options);
+    }
     let input = options.input.as_ref().expect("validated input");
-    if !input.is_file() {
-        return Err(format!("input file not found at {}", input.display()));
+    if !input.is_file() && !input.is_dir() {
+        return Err(format!(
+            "input file or directory not found at {}",
+            input.display()
+        ));
     }
     let opt = resolve_opt(options)?;
     let plugin = resolve_plugin(options)?;
-    let mut command = build_command(options, &opt, &plugin);
-
-    if options.dry_run {
-        println!("{}", command_display(&command));
-        return Ok(());
-    }
-
-    let status = command
-        .status()
-        .map_err(|error| format!("failed to execute {}: {error}", opt.display()))?;
-    if status.success() {
-        Ok(())
+    if input.is_dir() {
+        project::run_directory(options, &opt, &plugin)?;
     } else {
-        Err(match status.code() {
-            Some(code) => format!("LLVM opt exited with status {code}"),
-            None => "LLVM opt was terminated by a signal".to_owned(),
-        })
+        project::run_single_file(options, &opt, &plugin)?;
     }
+    if let Some(config) = &options.compare_config {
+        compare::run(
+            config,
+            input,
+            options.output.as_deref().unwrap_or_else(|| Path::new("-")),
+            options,
+        )?;
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -474,5 +813,19 @@ mod tests {
             shell_quote(OsStr::new("it's here.ll")),
             "'it'\\''s here.ll'"
         );
+    }
+
+    #[test]
+    fn rejects_project_selection_and_cache_for_single_files() {
+        for option in ["--cache-dir", "--include"] {
+            let values = if option == "--cache-dir" {
+                [option, "cache", "tests/fixtures/vectorizable.ll"]
+            } else {
+                [option, "*.ll", "tests/fixtures/vectorizable.ll"]
+            };
+            assert!(
+                matches!(parse_args(&args(&values)), Err(message) if message.contains("project directory"))
+            );
+        }
     }
 }

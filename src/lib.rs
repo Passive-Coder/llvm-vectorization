@@ -76,8 +76,9 @@ extern "C" fn llvmGetPassPluginInfo() -> PassPluginLibraryInfo {
 pub unsafe extern "C" fn rv_run_module(
     raw_module: *mut c_void,
     raw_config: *const RVPassConfig,
+    raw_function_analyses: *mut c_void,
 ) -> bool {
-    if raw_module.is_null() || raw_config.is_null() {
+    if raw_module.is_null() || raw_config.is_null() || raw_function_analyses.is_null() {
         return false;
     }
 
@@ -92,7 +93,7 @@ pub unsafe extern "C" fn rv_run_module(
             ffi_config.forced_vf,
             ffi_config.emit_remarks != 0,
         );
-        run_module(raw_module, config)
+        run_module(raw_module, config, raw_function_analyses)
     }));
     let mutated = take_ir_mutated();
     match result {
@@ -107,11 +108,15 @@ pub unsafe extern "C" fn rv_run_module(
     }
 }
 
-fn run_module(raw_module: *mut c_void, config: PassConfig) -> bool {
+fn run_module(
+    raw_module: *mut c_void,
+    config: PassConfig,
+    raw_function_analyses: *mut c_void,
+) -> bool {
     // SAFETY: the C++ adapter passes a live `llvm::Module` for the duration of
     // this call. The Rust side neither stores it nor takes ownership.
     let module = unsafe { llvm::wrap_module(raw_module) };
-    vectorizer::run(module, config)
+    vectorizer::run(module, config, raw_function_analyses)
 }
 
 #[cfg(test)]

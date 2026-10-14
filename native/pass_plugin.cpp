@@ -1,6 +1,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -20,7 +21,19 @@ struct RVPassConfig {
   std::uint32_t emit_remarks;
 };
 
-bool rv_run_module(void *module, const RVPassConfig *config);
+bool rv_run_module(void *module, const RVPassConfig *config, void *functionAnalyses);
+
+std::uint32_t rv_target_vector_bits(void *functionAnalyses, void *function) {
+  auto &manager = *static_cast<llvm::FunctionAnalysisManager *>(functionAnalyses);
+  auto *llvmFunction = llvm::unwrap<llvm::Function>(
+      reinterpret_cast<LLVMValueRef>(function));
+  const auto &tti = manager.getResult<llvm::TargetIRAnalysis>(*llvmFunction);
+  const auto bits = tti.getRegisterBitWidth(
+      llvm::TargetTransformInfo::RGK_FixedWidthVector);
+  if (bits.isScalable())
+    return 0;
+  return static_cast<std::uint32_t>(bits.getFixedValue());
+}
 
 void *rv_wrap_module(void *module) {
   return llvm::wrap(static_cast<llvm::Module *>(module));
@@ -97,8 +110,11 @@ public:
   explicit RustLoopVectorizePass(RVPassConfig config) : Config(config) {}
 
   llvm::PreservedAnalyses run(llvm::Module &module,
-                              llvm::ModuleAnalysisManager &) {
-    return rv_run_module(&module, &Config)
+                              llvm::ModuleAnalysisManager &analyses) {
+    auto &functionAnalyses = analyses
+        .getResult<llvm::FunctionAnalysisManagerModuleProxy>(module)
+        .getManager();
+    return rv_run_module(&module, &Config, &functionAnalyses)
                ? llvm::PreservedAnalyses::none()
                : llvm::PreservedAnalyses::all();
   }

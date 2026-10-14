@@ -79,7 +79,8 @@ propagates LLVM verifier failures:
 target/release/rv-vectorize --report input.ll -o output.ll
 ```
 
-It accepts textual LLVM IR (`.ll`) or bitcode (`.bc`). The default policy is
+It accepts textual LLVM IR (`.ll`), bitcode (`.bc`), supported source files,
+or an entire project directory. The default policy is
 `balanced`, the vector factor is selected automatically, textual IR is written
 to stdout when `-o` is omitted, and LLVM verification is enabled. Common
 variants are:
@@ -102,6 +103,143 @@ variables are `LLVM_SYS_211_PREFIX`, `LLVM_CONFIG_PATH`, and
 `RV_PLUGIN_PATH`. Fixed `--vf` values bypass profitability but never bypass
 dependence or legality checks.
 
+### Project directories and languages
+
+```sh
+target/release/rv-vectorize --report path/to/project -o path/to/vectorized-ir
+target/release/rv-vectorize --emit-bitcode path/to/project -o path/to/vectorized-bc
+target/release/rv-vectorize path/to/project/src/kernel.cpp -o kernel.ll
+```
+
+Directory mode recursively processes each LLVM module separately and mirrors
+the relative paths into the output directory. The CLI reports `processed`,
+`failed`, and `skipped` counts, continues after an individual file fails, and
+returns a nonzero status if any file fails. With `--report`, each group of loop
+decisions is preceded by its input path. It skips non-source assets,
+symlinks, hidden directories, `target`, `node_modules`, and `vendor`. If the
+output directory is inside the input tree, it is excluded from scanning and
+marked as a generated output directory. Marked output trees from earlier runs
+are also excluded on later scans. Existing source directories cannot be
+selected as nested output directories. Generated outputs are written through
+temporary files, so a compiler or verifier failure preserves any previous
+output. Input/output aliases and output symlinks are rejected.
+
+The built-in source adapters are C, C++, Objective-C, Objective-C++ (the LLVM
+21 Clang beside `opt`), Fortran (LLVM 21 `flang` or `flang-new`), Rust (`rustc`),
+and Swift (`swiftc`). The latter tools must be installed, and their emitted
+LLVM IR must be accepted by LLVM 21. Source outputs retain the source
+extension, for example
+`src/kernel.cpp` becomes `src/kernel.cpp.ll`. A `.ll` file keeps its name;
+`.bc` becomes `.bc.ll` when emitting text. `--emit-bitcode` changes the output
+suffix to `.bc`.
+
+For any other language with a compiler that emits LLVM IR or bitcode, either
+put its generated `.ll`/`.bc` files in the input tree or explicitly supply a
+JSON frontend configuration. Each extension maps to an argv array containing
+exactly one `{input}` and `{output}` placeholder:
+
+```json
+{
+  "toy": ["/path/to/toy-compiler", "--emit-llvm", "{input}", "-o", "{output}"]
+}
+```
+
+```sh
+target/release/rv-vectorize --frontend-config frontends.json \
+  path/to/project -o path/to/vectorized-ir
+```
+
+The CLI executes these arguments directly without a shell. Only use a frontend
+configuration you trust, since its programs run with your account privileges.
+An entry for a built-in extension replaces that adapter, which can supply
+project-specific include paths or compiler flags.
+
+The CLI compiles standalone translation units. Rust crates with external
+dependencies, Swift multi-file modules, C/C++ projects needing build-specific
+flags, and other complex builds may require producing LLVM IR with the native
+build system first. Every language still uses the same conservative loop
+legality contract below; support for a frontend does not mean every source
+loop is vectorized. `--report` explains each candidate's decision.
+
+### Build-aware and advanced project runs
+
+For a C-family project, pass a [Clang JSON compilation database](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
+whose entries have `arguments` arrays. The driver reuses each entry's working
+directory, include paths, defines, and target flags. It selects the LLVM 21
+Clang beside `opt` and replaces output/dependency-emission flags with LLVM IR
+emission. Entries containing only `command` strings are rejected; the driver
+never interprets them with a shell. Repeated entries for one source receive
+distinct, stable output names.
+
+```sh
+target/release/rv-vectorize --compile-commands build/compile_commands.json \
+  --emit-object --report-json build/vectorization.json \
+  . -o build/vectorized-objects
+```
+
+Other build systems can provide LLVM modules through `--input-manifest`. Its
+JSON entries map a project-relative source identity to a `.ll` or `.bc` file;
+`ir` paths are resolved relative to the manifest file:
+
+```json
+[{"file":"src/kernel.toy","ir":"build/kernel.ll"}]
+```
+
+Object mode uses LLVM 21 `llc` and writes one linkable `.o` per selected
+module. The JSON report lists each source and output path for the native build
+to consume. The CLI does not link a whole application on its own.
+
+The default `--engine rust` keeps the bounded Rust legality contract. With
+`--engine hybrid`, LLVM's Loop Vectorizer runs after the Rust pass, enabling
+LLVM 21's supported reductions, guarded pointer disambiguation, and predicated
+multi-block loops. `--engine llvm` runs only LLVM's Loop Vectorizer. A fixed
+`--vf` also sets LLVM's vector width in those modes. Rust-loop decisions in
+`--report` and the JSON `loops` array describe the Rust pass; the JSON
+`llvm_remarks` array records LLVM's own optimization remarks in hybrid and LLVM
+modes. The JSON `toolchain` record includes LLVM and Clang versions, the plugin
+digest, and selected target settings. LLVM can vectorize a loop that the Rust
+pass rejected. `--fail-on-missed` therefore applies only to `--engine rust`.
+When the module declares a target triple, the Rust planner
+uses LLVM `TargetTransformInfo` for automatic register width. `--cpu`,
+`--features`, and `--target-triple` configure LLVM planning and object emission.
+
+Project selection supports repeatable `--include GLOB` and `--exclude GLOB`,
+honors nested `.gitignore` files by default, and has `--no-gitignore` and
+`--explain-skips` switches. `--jobs N` processes modules in parallel while the
+JSON report keeps deterministic file order. `--cache-dir PATH` reuses direct
+IR/bitcode and compilation-database artifacts after hashing their content,
+compiler arguments, toolchain, plugin, and Clang-discovered dependencies.
+Unknown source dependencies and response files bypass the cache. The cache
+is available in project mode and must be outside the project and output trees.
+
+`--timeout-seconds`, `--max-memory-mib`, and `--max-input-bytes` bound work per
+subprocess or input. Linux uses an address-space limit; macOS monitors resident
+memory and terminates a process that exceeds the limit. A failed file leaves
+any previous artifact untouched. `--doctor` checks LLVM tools and plugin
+loading, then reports whether optional Fortran, Rust, and Swift frontends emit
+IR that LLVM 21 can verify.
+
+For CI, `--fail-on-missed N` gates Rust-pass rejections. `--compare-config`
+runs explicit baseline and candidate argv arrays after vectorization, checks
+exit status and output, and can reject a median runtime regression. This
+example uses executable paths or program names in argv arrays; it never sends
+a command string to a shell:
+
+```json
+{
+  "prepare_candidate": ["./link-vectorized", "{output}"],
+  "baseline": ["./build/baseline-test"],
+  "candidate": ["./build/vectorized-test"],
+  "iterations": 5,
+  "max_regression_percent": 10
+}
+```
+
+`{input}` and `{output}` placeholders work in every comparison argument.
+`compare_stderr` defaults to `true`; set it to `false` for programs whose
+diagnostic text is intentionally variable. Only use comparison and frontend
+configurations you trust, since they name programs run with your privileges.
+
 ### Interactive TUI application
 
 The project also includes a full-screen terminal application:
@@ -113,8 +251,10 @@ target/release/rv-vectorize-tui
 ```
 
 The TUI starts with the positive fixture and `build/tui-vectorized.ll` as its
-default input and output. It provides editable paths, policy and vector-width
-selectors, diagnostics/verification/bitcode toggles, and an on-screen results
+default input and output. Its editable paths also accept a project directory
+and output directory; the side-by-side diff is available for textual single
+files. It provides policy and vector-width selectors,
+diagnostics/verification/bitcode toggles, and an on-screen results
 pane containing the vectorizer's per-loop decisions.
 
 Keyboard controls:
@@ -203,7 +343,7 @@ memory-alignment properties.
 Not yet supported: runtime alias versioning, reductions, calls/intrinsics,
 multi-block control flow and if-conversion, nonunit/descending induction,
 masked tails, scalable vectors, interleaving, outer-loop vectorization, or
-TargetTransformInfo-based costing. Each becomes a safe future extension only
+instruction-level TargetTransformInfo costing. Each becomes a safe future extension only
 with its corresponding legality proof and tests.
 
 ## Verification
@@ -214,13 +354,15 @@ Run the complete suite:
 ./scripts/test.sh
 ```
 
-It currently covers 43 Rust tests, the CLI and TUI applications, nine positive
+It currently covers 45 Rust tests, the CLI and TUI applications, nine positive
 LLVM loops plus a fourteen-loop breadth showcase spanning VF 2/4/8/16 and every
 supported element type, twenty-nine conservative rejection fixtures covering
 distinct named reasons, a byte-for-byte check that a fully rejected module is
 left unmodified, policy selection, forced VF, LLVM's verifier, native
 differential execution over boundary trip counts, all three supported latch
-forms, memory-order cases, and guard-page detection of tail over-read/write.
+forms, memory-order cases, guard-page detection of tail over-read/write, and
+mixed-language project traversal with output-alias and failure-preservation
+checks.
 
 Run the generated differential corpus in quick mode:
 

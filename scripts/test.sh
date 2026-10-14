@@ -232,6 +232,9 @@ grep -q 'decision=vectorized' "$build_dir/cli-vectorized.remarks"
 "$cli" --opt "$opt" --plugin "$plugin" --vf 8 tests/fixtures/heuristics.ll -o "$build_dir/cli-forced-vf8.ll"
 grep -q 'load <8 x i32>' "$build_dir/cli-forced-vf8.ll"
 
+sh tests/project_mode.sh
+sh tests/advanced_cli.sh
+
 sdk_flags=
 if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
   sdk_path=$(xcrun --show-sdk-path)
