@@ -319,6 +319,63 @@ PY
   "$repo_dir/tests/fixtures/vectorizable.ll" -o "$work/compared.ll" \
   > "$work/compare-out"
 grep -q 'comparison=passed' "$work/compare-out"
+"$cli" --opt "$opt" --plugin "$plugin" --compare-config "$work/compare.json" \
+  --compare-report-json "$repo_dir/tests/fixtures/vectorizable.ll" \
+  -o "$work/compared.ll" > "$work/compare-json-out"
+python3 - "$work/compare-json-out" <<'PY'
+import json, sys
+record = next(line.split("=", 1)[1] for line in open(sys.argv[1])
+              if line.startswith("program_comparison_json="))
+report = json.loads(record)
+assert report["baseline_stdout"] == "same result\n"
+assert report["candidate_stdout"] == "same result\n"
+assert report["outputs_match"] is True
+assert report["iterations"] == 2
+assert report["baseline_median_ms"] >= 0
+assert report["candidate_median_ms"] >= 0
+assert report["baseline_run_ms"] >= 0
+assert report["candidate_run_ms"] >= 0
+PY
+"$cli" --opt "$opt" --plugin "$plugin" --compare-auto --compare-report-json \
+  "$repo_dir/examples/run_program_demo.c" -o "$work/auto-program.ll" \
+  > "$work/auto-program-out"
+python3 - "$work/auto-program-out" <<'PY'
+import json, sys
+record = next(line.split("=", 1)[1] for line in open(sys.argv[1])
+              if line.startswith("program_comparison_json="))
+report = json.loads(record)
+assert report["baseline_stdout"] == "sum=1571328\n"
+assert report["candidate_stdout"] == "sum=1571328\n"
+assert report["outputs_match"] is True
+assert report["iterations"] == 1
+assert report["warmup_iterations"] == 1
+PY
+cat > "$work/parallel-check.py" <<'PY'
+#!/usr/bin/env python3
+import pathlib, sys, time
+name, directory = sys.argv[1:]
+directory = pathlib.Path(directory)
+(directory / name).touch()
+other = directory / ("candidate" if name == "baseline" else "baseline")
+deadline = time.monotonic() + 3
+while not other.exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+if not other.exists():
+    sys.exit("programs did not overlap")
+print("parallel result")
+PY
+chmod +x "$work/parallel-check.py"
+python3 - "$work/parallel.json" "$work/parallel-check.py" "$work" <<'PY'
+import json, sys
+config, program, directory = sys.argv[1:]
+with open(config, "w") as stream:
+    json.dump({"baseline": [program, "baseline", directory],
+               "candidate": [program, "candidate", directory]}, stream)
+PY
+"$cli" --opt "$opt" --plugin "$plugin" --compare-config "$work/parallel.json" \
+  "$repo_dir/tests/fixtures/vectorizable.ll" -o "$work/parallel.ll" \
+  > "$work/parallel-out"
+grep -q 'comparison=passed' "$work/parallel-out"
 printf '#!/bin/sh\nprintf "different result\\n"\n' > "$work/candidate-run"
 chmod +x "$work/candidate-run"
 if "$cli" --opt "$opt" --plugin "$plugin" --compare-config "$work/compare.json" \
@@ -328,6 +385,18 @@ if "$cli" --opt "$opt" --plugin "$plugin" --compare-config "$work/compare.json" 
   exit 1
 fi
 grep -q 'comparison outputs differ' "$work/mismatch-err"
+"$cli" --opt "$opt" --plugin "$plugin" --compare-config "$work/compare.json" \
+  --compare-report-json "$repo_dir/tests/fixtures/vectorizable.ll" \
+  -o "$work/compared.ll" > "$work/mismatch-json-out" 2> "$work/mismatch-json-err" && exit 1
+python3 - "$work/mismatch-json-out" <<'PY'
+import json, sys
+record = next(line.split("=", 1)[1] for line in open(sys.argv[1])
+              if line.startswith("program_comparison_json="))
+report = json.loads(record)
+assert report["outputs_match"] is False
+assert report["baseline_stdout"] == "same result\n"
+assert report["candidate_stdout"] == "different result\n"
+PY
 
 cat > "$work/baseline-run" <<'EOF'
 #!/bin/sh

@@ -1,0 +1,9 @@
+rv-vectorize: function=add_f32 loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=192.875 transform_us=344.083
+rv-vectorize: function=scale_i32 loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=1.875 transform_us=21.125
+rv-vectorize: function=write_index loop=loop decision=vectorized reason=legal-and-profitable vf=2 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=0.791 transform_us=121.917
+rv-vectorize: function=clamp_min_i32 loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=1.417 transform_us=4.041
+rv-vectorize: function=widen_i16 loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=1.125 transform_us=201.541
+rv-vectorize: function=increment_in_place loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=2.708 transform_us=4.708
+rv-vectorize: function=increment_in_place_ne loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=1.250 transform_us=2.042
+rv-vectorize: function=increment_in_place_ult loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=0.875 transform_us=1.625
+rv-vectorize: function=ordered_double_store loop=loop decision=vectorized reason=legal-and-profitable vf=4 estimated_vector_coverage=100% issued_lane_utilization=100% analysis_us=0.875 transform_us=1.875

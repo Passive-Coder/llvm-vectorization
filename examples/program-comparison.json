@@ -1,0 +1,7 @@
+{
+  "prepare_baseline": ["clang", "-O0", "-fno-vectorize", "-fno-slp-vectorize", "-fno-unroll-loops", "{input}", "-lm", "-o", "../build/normal-program"],
+  "prepare_candidate": ["clang", "-O1", "{output}", "-lm", "-o", "../build/vectorized-program"],
+  "baseline": ["../build/normal-program"],
+  "candidate": ["../build/vectorized-program"],
+  "iterations": 5
+}

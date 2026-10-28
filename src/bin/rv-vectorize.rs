@@ -43,6 +43,8 @@ OPTIONS:
         --max-input-bytes <N> Reject larger source or IR files
         --compare-config <PATH>
                             Compare explicit baseline and candidate programs
+        --compare-auto        Build and compare a standalone C, C++, or LLVM IR program
+        --compare-report-json  Emit bounded program output and timings for the TUI
         --policy <POLICY>     balanced, conservative, or aggressive
         --vf <WIDTH>          auto, 2, 4, 8, or 16
         --engine <ENGINE>     rust, hybrid, or llvm
@@ -189,6 +191,8 @@ struct Options {
     max_memory_mib: Option<u64>,
     max_input_bytes: Option<u64>,
     compare_config: Option<PathBuf>,
+    compare_auto: bool,
+    compare_report_json: bool,
     dry_run: bool,
 }
 
@@ -360,6 +364,10 @@ fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
                 &mut index,
                 "--compare-config",
             )?));
+        } else if text == Some("--compare-report-json") {
+            options.compare_report_json = true;
+        } else if text == Some("--compare-auto") {
+            options.compare_auto = true;
         } else if text == Some("--report") {
             options.report = true;
         } else if text == Some("--report-json") {
@@ -461,8 +469,17 @@ fn parse_args(arguments: &[OsString]) -> Result<Parsed, String> {
     if options.dry_run && (options.report_json.is_some() || options.fail_on_missed.is_some()) {
         return Err("report and missed-loop gates require a real run".to_owned());
     }
-    if options.dry_run && options.compare_config.is_some() {
-        return Err("--compare-config requires a real run".to_owned());
+    if options.dry_run && (options.compare_config.is_some() || options.compare_auto) {
+        return Err("program comparison requires a real run".to_owned());
+    }
+    if options.compare_auto && options.compare_config.is_some() {
+        return Err("--compare-auto and --compare-config cannot be combined".to_owned());
+    }
+    if options.compare_auto && options.input.as_ref().is_some_and(|input| input.is_dir()) {
+        return Err("--compare-auto requires a standalone file; use --compare-config for a project directory".to_owned());
+    }
+    if options.compare_report_json && options.compare_config.is_none() && !options.compare_auto {
+        return Err("--compare-report-json requires a comparison mode".to_owned());
     }
     if options.input.as_ref().is_some_and(|input| input.is_file())
         && (options.compile_commands.is_some()
@@ -720,6 +737,12 @@ fn run(options: &Options) -> Result<(), String> {
     if let Some(config) = &options.compare_config {
         compare::run(
             config,
+            input,
+            options.output.as_deref().unwrap_or_else(|| Path::new("-")),
+            options,
+        )?;
+    } else if options.compare_auto {
+        compare::run_auto(
             input,
             options.output.as_deref().unwrap_or_else(|| Path::new("-")),
             options,

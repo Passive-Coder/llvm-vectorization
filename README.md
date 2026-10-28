@@ -239,6 +239,16 @@ a command string to a shell:
 `compare_stderr` defaults to `true`; set it to `false` for programs whose
 diagnostic text is intentionally variable. Only use comparison and frontend
 configurations you trust, since they name programs run with your privileges.
+For standalone C, C++, LLVM IR, or bitcode programs with `main`, use
+`--compare-auto` instead of a config. It builds temporary normal and vectorized
+executables, launches both concurrently once to warm them up, then launches
+both concurrently for one timed run. The
+normal executable is compiled at `-O0` with loop vectorization, SLP
+vectorization, and loop unrolling disabled; the vectorized executable uses
+the transformed LLVM IR.
+Add `--compare-report-json` to print a machine-readable comparison record with
+the displayed run's stdout/stderr and runtime for both programs. The TUI
+uses this record; captured output is limited to 32 KiB per stream in the record.
 
 ### Interactive TUI application
 
@@ -250,10 +260,22 @@ make tui
 target/release/rv-vectorize-tui
 ```
 
-The TUI starts with the positive fixture and `build/tui-vectorized.ll` as its
+The TUI starts with the runnable `examples/run_program_demo.c` and
+`build/tui-vectorized.ll` as its
 default input and output. Its editable paths also accept a project directory
 and output directory; the side-by-side diff is available for textual single
-files. It provides policy and vector-width selectors,
+files. Select **Run program** to vectorize, build, and concurrently run a
+standalone C, C++, LLVM IR, or bitcode program. The comparison screen shows
+their stdout, stderr, runtimes, and whether the outputs match. The
+Compare JSON field is optional for those files. For projects or other languages,
+enter a comparison config whose `prepare_baseline` and `prepare_candidate`
+commands define how to build the programs for that language and build system.
+For a ready-to-run C demo, set Input to `examples/run_program_demo.c`,
+Output to `build/run-program-vectorized.ll`, leave Compare JSON blank, then
+select **Run program** or press `Ctrl-P`. The reported time is the measured
+whole-program wall time of that run, including
+process startup; use a longer running benchmark for meaningful speed ratios.
+It provides policy and vector-width selectors,
 diagnostics/verification/bitcode toggles, and an on-screen results
 pane containing the vectorizer's per-loop decisions.
 
@@ -265,6 +287,7 @@ Keyboard controls:
 | `←`, `→` | Move within text or change a selector. |
 | `Enter`, `Space` | Toggle a setting or activate the Run button. |
 | `Ctrl-R` | Run from anywhere in the application. |
+| `Ctrl-P` | Run and compare the normal and vectorized programs. |
 | Mouse wheel | Scroll the session pane. |
 | `PageUp`, `PageDown` | Scroll the session pane by five rows. |
 | `Ctrl-↑`, `Ctrl-↓` | Scroll the session pane one row. |

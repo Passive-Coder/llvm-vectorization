@@ -22,11 +22,12 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
+use serde::Deserialize;
 use similar::{DiffOp, TextDiff};
 
 const POLICIES: [&str; 3] = ["balanced", "conservative", "aggressive"];
 const VECTOR_WIDTHS: [&str; 5] = ["auto", "2", "4", "8", "16"];
-const FIELD_COUNT: usize = 9;
+const FIELD_COUNT: usize = 11;
 const HISTORY_CAP: usize = 8;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(80);
@@ -122,6 +123,21 @@ struct WorkerResult {
 enum ViewMode {
     Config,
     Diff,
+    Programs,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ProgramReport {
+    baseline_stdout: String,
+    baseline_stderr: String,
+    candidate_stdout: String,
+    candidate_stderr: String,
+    baseline_run_ms: f64,
+    candidate_run_ms: f64,
+    iterations: usize,
+    warmup_iterations: usize,
+    outputs_match: bool,
+    within_regression_limit: bool,
 }
 
 /// How a single diff row should be colored, GitHub-review style.
@@ -155,6 +171,7 @@ enum Side {
 struct App {
     input: TextField,
     output: TextField,
+    compare_config: TextField,
     policy: usize,
     vector_width: usize,
     report: bool,
@@ -173,6 +190,9 @@ struct App {
     spinner_frame: usize,
     tick_count: u64,
     worker: Option<Receiver<WorkerResult>>,
+    pending_program_run: bool,
+    program_report: Option<ProgramReport>,
+    program_scroll: u16,
     run_input: String,
     run_output: String,
     view: ViewMode,
@@ -198,8 +218,9 @@ impl fmt::Debug for App {
 impl Default for App {
     fn default() -> Self {
         Self {
-            input: TextField::new("tests/fixtures/vectorizable.ll"),
+            input: TextField::new("examples/run_program_demo.c"),
             output: TextField::new("build/tui-vectorized.ll"),
+            compare_config: TextField::new(""),
             policy: 0,
             vector_width: 0,
             report: true,
@@ -214,6 +235,9 @@ impl Default for App {
             spinner_frame: 0,
             tick_count: 0,
             worker: None,
+            pending_program_run: false,
+            program_report: None,
+            program_scroll: 0,
             run_input: String::new(),
             run_output: String::new(),
             view: ViewMode::Config,
@@ -279,6 +303,14 @@ impl App {
             };
             return;
         }
+        if self.view == ViewMode::Programs {
+            self.program_scroll = if delta < 0 {
+                self.program_scroll.saturating_sub(3)
+            } else {
+                self.program_scroll.saturating_add(3)
+            };
+            return;
+        }
         self.scroll_transcript(delta);
     }
 
@@ -294,20 +326,21 @@ impl App {
         match self.focused {
             0 => Some(&mut self.input),
             1 => Some(&mut self.output),
+            2 => Some(&mut self.compare_config),
             _ => None,
         }
     }
 
     fn cycle_selected(&mut self, forward: bool) {
         match self.focused {
-            2 => {
+            3 => {
                 self.policy = if forward {
                     (self.policy + 1) % POLICIES.len()
                 } else {
                     (self.policy + POLICIES.len() - 1) % POLICIES.len()
                 };
             }
-            3 => {
+            4 => {
                 self.vector_width = if forward {
                     (self.vector_width + 1) % VECTOR_WIDTHS.len()
                 } else {
@@ -320,9 +353,9 @@ impl App {
 
     fn toggle_selected(&mut self) {
         match self.focused {
-            4 => self.report = !self.report,
-            5 => self.verify = !self.verify,
-            6 => self.emit_bitcode = !self.emit_bitcode,
+            5 => self.report = !self.report,
+            6 => self.verify = !self.verify,
+            7 => self.emit_bitcode = !self.emit_bitcode,
             _ => {}
         }
     }
@@ -333,12 +366,14 @@ impl App {
         if self.diff_labels.is_none() {
             return;
         }
-        self.view = match self.view {
-            ViewMode::Config => ViewMode::Diff,
-            ViewMode::Diff => ViewMode::Config,
+        self.view = if self.view == ViewMode::Diff {
+            ViewMode::Config
+        } else {
+            ViewMode::Diff
         };
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -351,6 +386,10 @@ impl App {
             self.toggle_diff_view();
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.run_program();
+            return;
+        }
 
         if self.view == ViewMode::Diff {
             match key.code {
@@ -359,6 +398,17 @@ impl App {
                 KeyCode::Down => self.diff_scroll = self.diff_scroll.saturating_add(1),
                 KeyCode::PageUp => self.diff_scroll = self.diff_scroll.saturating_sub(10),
                 KeyCode::PageDown => self.diff_scroll = self.diff_scroll.saturating_add(10),
+                _ => {}
+            }
+            return;
+        }
+        if self.view == ViewMode::Programs {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.view = ViewMode::Config,
+                KeyCode::Up => self.program_scroll = self.program_scroll.saturating_sub(1),
+                KeyCode::Down => self.program_scroll = self.program_scroll.saturating_add(1),
+                KeyCode::PageUp => self.program_scroll = self.program_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.program_scroll = self.program_scroll.saturating_add(10),
                 _ => {}
             }
             return;
@@ -422,13 +472,14 @@ impl App {
                     field.delete();
                 }
             }
-            KeyCode::Enter if self.focused == 7 => self.execute(),
-            KeyCode::Enter if self.focused == 8 => self.toggle_diff_view(),
-            KeyCode::Char(' ') | KeyCode::Enter if (4..=6).contains(&self.focused) => {
+            KeyCode::Enter if self.focused == 8 => self.execute(),
+            KeyCode::Enter if self.focused == 9 => self.run_program(),
+            KeyCode::Enter if self.focused == 10 => self.toggle_diff_view(),
+            KeyCode::Char(' ') | KeyCode::Enter if (5..=7).contains(&self.focused) => {
                 self.toggle_selected();
             }
             KeyCode::Char(character)
-                if self.focused <= 1
+                if self.focused <= 2
                     && !key
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
@@ -465,6 +516,18 @@ impl App {
         arguments
     }
 
+    fn program_command_arguments(&self) -> Vec<String> {
+        let mut arguments = self.command_arguments();
+        let compare_path = self.compare_config.value.trim();
+        if compare_path.is_empty() {
+            arguments.push("--compare-auto".to_owned());
+        } else {
+            arguments.extend(["--compare-config".to_owned(), compare_path.to_owned()]);
+        }
+        arguments.push("--compare-report-json".to_owned());
+        arguments
+    }
+
     /// Push a terminal (non-running) entry straight onto the transcript,
     /// for validation failures that never reach the child process.
     fn push_immediate_failure(&mut self, message: impl Into<String>) {
@@ -489,6 +552,14 @@ impl App {
     /// thread so the interface can keep animating instead of freezing
     /// until the child process exits.
     fn execute(&mut self) {
+        self.execute_with_compare(false);
+    }
+
+    fn run_program(&mut self) {
+        self.execute_with_compare(true);
+    }
+
+    fn execute_with_compare(&mut self, compare: bool) {
         if self.worker.is_some() {
             // A run is already in flight; ignore the request rather than
             // starting a second overlapping child process.
@@ -496,6 +567,11 @@ impl App {
         }
         if self.input.value.trim().is_empty() || self.output.value.trim().is_empty() {
             self.push_immediate_failure("Input and output paths are required.");
+            return;
+        }
+        let compare_path = self.compare_config.value.trim();
+        if compare && !compare_path.is_empty() && !Path::new(compare_path).is_file() {
+            self.push_immediate_failure("Run program needs an existing compare config JSON file.");
             return;
         }
 
@@ -522,7 +598,12 @@ impl App {
         self.run_input = self.input.value.clone();
         self.run_output = self.output.value.clone();
 
-        let arguments = self.command_arguments();
+        let arguments = if compare {
+            self.program_command_arguments()
+        } else {
+            self.command_arguments()
+        };
+        self.pending_program_run = compare;
         let command_display = format!(
             "{} {}",
             executable.display(),
@@ -578,6 +659,18 @@ impl App {
             return;
         };
         self.worker = None;
+        let program_run = std::mem::take(&mut self.pending_program_run);
+        if program_run {
+            self.program_report = result
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("program_comparison_json="))
+                .and_then(|json| serde_json::from_str(json).ok());
+            if self.program_report.is_some() {
+                self.program_scroll = 0;
+                self.view = ViewMode::Programs;
+            }
+        }
         if let Some(entry) = self.history.last_mut() {
             if let Some(error) = result.spawn_error {
                 entry.status = EntryStatus::Failed;
@@ -586,7 +679,11 @@ impl App {
             }
             let mut detail = if result.success {
                 entry.status = EntryStatus::Success;
-                "wrote output successfully.".to_owned()
+                if program_run {
+                    "program comparison completed.".to_owned()
+                } else {
+                    "wrote output successfully.".to_owned()
+                }
             } else {
                 entry.status = EntryStatus::Failed;
                 format!(
@@ -600,9 +697,18 @@ impl App {
                 detail.push('\n');
                 detail.push_str(result.stderr.trim());
             }
-            if !result.stdout.trim().is_empty() {
+            let display_stdout = result
+                .stdout
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("program_comparison_json=")
+                        && (!program_run || !line.starts_with("comparison=passed"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !display_stdout.trim().is_empty() {
                 detail.push_str("\n\nstdout:\n");
-                detail.push_str(result.stdout.trim());
+                detail.push_str(display_stdout.trim());
             }
             entry.detail = detail;
         }
@@ -1025,19 +1131,20 @@ fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: R
     frame.render_widget(config_block, form_area);
 
     let [fields_area, buttons_area] =
-        Layout::vertical([Constraint::Length(10), Constraint::Min(7)]).areas(inner);
+        Layout::vertical([Constraint::Length(11), Constraint::Length(3)]).areas(inner);
 
     let lines = vec![
         field_line("Input", &app.input.value, app.focused == 0),
         field_line("Output", &app.output.value, app.focused == 1),
+        field_line("Compare JSON", &app.compare_config.value, app.focused == 2),
         Line::raw(""),
         label_line("Policy"),
-        segmented_line(&POLICIES, app.policy, app.focused == 2),
+        segmented_line(&POLICIES, app.policy, app.focused == 3),
         label_line("Vector width"),
-        segmented_line(&VECTOR_WIDTHS, app.vector_width, app.focused == 3),
-        toggle_line("Report", app.report, app.focused == 4),
-        toggle_line("Verify", app.verify, app.focused == 5),
-        toggle_line("Bitcode", app.emit_bitcode, app.focused == 6),
+        segmented_line(&VECTOR_WIDTHS, app.vector_width, app.focused == 4),
+        toggle_line("Report", app.report, app.focused == 5),
+        toggle_line("Verify", app.verify, app.focused == 6),
+        toggle_line("Bitcode", app.emit_bitcode, app.focused == 7),
     ];
     // Deliberately not wrapped: every entry above is exactly one row, and
     // draw_cursor()/the field indices below assume that row == field
@@ -1047,18 +1154,27 @@ fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: R
     let fields = Paragraph::new(lines);
     frame.render_widget(fields, fields_area);
 
-    let [run_area, _gap, diff_area] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(3),
+    let [run_area, program_area, diff_area] = Layout::horizontal([
+        Constraint::Percentage(34),
+        Constraint::Percentage(33),
+        Constraint::Percentage(33),
     ])
     .areas(buttons_area);
+    let wide = buttons_area.width >= 48;
     draw_button(
         frame,
         run_area,
-        "▶",
-        "Run vectorizer",
-        app.focused == 7,
+        if wide { "▶" } else { "" },
+        if wide { "Vectorize" } else { "Vec" },
+        app.focused == 8,
+        true,
+    );
+    draw_button(
+        frame,
+        program_area,
+        if wide { "▷" } else { "" },
+        if wide { "Run program" } else { "Program" },
+        app.focused == 9,
         true,
     );
     let diff_label = if app.view == ViewMode::Diff {
@@ -1069,9 +1185,9 @@ fn draw_config(frame: &mut Frame, app: &App, form_area: Rect, transcript_area: R
     draw_button(
         frame,
         diff_area,
-        "▤",
-        diff_label,
-        app.focused == 8,
+        if wide { "▤" } else { "" },
+        if wide { diff_label } else { "Diff" },
+        app.focused == 10,
         app.diff_labels.is_some(),
     );
 
@@ -1243,8 +1359,112 @@ fn draw_diff(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(right, right_area);
 }
 
+fn program_lines(stdout: &str, stderr: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled("stdout", Style::default().fg(ACCENT).bold())];
+    if stdout.is_empty() {
+        lines.push(Line::raw("(empty)"));
+    } else {
+        lines.extend(stdout.lines().map(|line| Line::raw(line.to_owned())));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("stderr", Style::default().fg(ACCENT).bold()));
+    if stderr.is_empty() {
+        lines.push(Line::raw("(empty)"));
+    } else {
+        lines.extend(stderr.lines().map(|line| Line::raw(line.to_owned())));
+    }
+    lines
+}
+
+fn draw_programs(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(report) = &app.program_report else {
+        return;
+    };
+    let [summary, panes] =
+        Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+    let status = if !report.outputs_match {
+        "outputs differ"
+    } else if !report.within_regression_limit {
+        "runtime regression limit exceeded"
+    } else {
+        "outputs match"
+    };
+    let status_color = if report.outputs_match && report.within_regression_limit {
+        SUCCESS
+    } else {
+        FAILURE
+    };
+    let runtime_change = if report.baseline_run_ms == 0.0 {
+        0.0
+    } else {
+        (report.candidate_run_ms / report.baseline_run_ms - 1.0) * 100.0
+    };
+    let warmup = if report.warmup_iterations == 0 {
+        String::new()
+    } else {
+        format!("  ·  {} warm-up", report.warmup_iterations)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{status}  "),
+                Style::default().fg(status_color).bold(),
+            ),
+            Span::styled(
+                format!(
+                    "{} timed run{}{}  ·  runtime change {runtime_change:+.1}%",
+                    report.iterations,
+                    if report.iterations == 1 { "" } else { "s" },
+                    warmup
+                ),
+                Style::default().fg(TEXT),
+            ),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Program comparison "),
+        ),
+        summary,
+    );
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(panes);
+    for (pane, title, stdout, stderr, color) in [
+        (
+            left_area,
+            format!(" Normal  ·  runtime {:.3} ms ", report.baseline_run_ms),
+            &report.baseline_stdout,
+            &report.baseline_stderr,
+            ACCENT,
+        ),
+        (
+            right_area,
+            format!(" Vectorized  ·  runtime {:.3} ms ", report.candidate_run_ms),
+            &report.candidate_stdout,
+            &report.candidate_stderr,
+            SUCCESS,
+        ),
+    ] {
+        frame.render_widget(
+            Paragraph::new(Text::from(program_lines(stdout, stderr)))
+                .block(
+                    Block::default()
+                        .title(title)
+                        .title_style(Style::default().fg(TEXT).bold())
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(color))
+                        .padding(Padding::new(1, 1, 0, 0)),
+                )
+                .scroll((app.program_scroll, 0)),
+            pane,
+        );
+    }
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let spans = if app.view == ViewMode::Diff {
+    let spans = if app.view == ViewMode::Diff || app.view == ViewMode::Programs {
         vec![
             Span::styled(
                 " ❯ ",
@@ -1252,7 +1472,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
             "↑↓/pgup/pgdn".fg(ACCENT).bold(),
             Span::styled(" scroll  ", Style::default().fg(MUTED)),
-            "d/esc".fg(ACCENT).bold(),
+            "esc".fg(ACCENT).bold(),
             Span::styled(" back  ", Style::default().fg(MUTED)),
             "ctrl-c".fg(ACCENT).bold(),
             Span::styled(" quit ", Style::default().fg(MUTED)),
@@ -1271,6 +1491,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(" select  ", Style::default().fg(MUTED)),
             "ctrl-r".fg(ACCENT).bold(),
             Span::styled(" run  ", Style::default().fg(MUTED)),
+            "ctrl-p".fg(ACCENT).bold(),
+            Span::styled(" program  ", Style::default().fg(MUTED)),
             "wheel/pgup/pgdn".fg(ACCENT).bold(),
             Span::styled(" scroll  ", Style::default().fg(MUTED)),
         ];
@@ -1310,6 +1532,7 @@ fn draw(frame: &mut Frame, app: &App) {
             draw_cursor(frame, app, fields_area);
         }
         ViewMode::Diff => draw_diff(frame, app, content_area),
+        ViewMode::Programs => draw_programs(frame, app, content_area),
     }
 
     draw_footer(frame, app, footer_area);
@@ -1319,6 +1542,7 @@ fn draw_cursor(frame: &mut Frame, app: &App, fields_area: Rect) {
     let field = match app.focused {
         0 => &app.input,
         1 => &app.output,
+        2 => &app.compare_config,
         _ => return,
     };
     let row = u16::try_from(app.focused).unwrap_or_default();
@@ -1385,7 +1609,7 @@ mod tests {
                 "--policy",
                 "balanced",
                 "--report",
-                "tests/fixtures/vectorizable.ll",
+                "examples/run_program_demo.c",
                 "-o",
                 "build/tui-vectorized.ll"
             ]
@@ -1423,7 +1647,7 @@ mod tests {
     #[test]
     fn selectors_cycle_in_both_directions() {
         let mut app = App {
-            focused: 2,
+            focused: 3,
             ..App::default()
         };
         app.cycle_selected(false);
@@ -1431,7 +1655,7 @@ mod tests {
         app.cycle_selected(true);
         assert_eq!(POLICIES[app.policy], "balanced");
 
-        app.focused = 3;
+        app.focused = 4;
         app.cycle_selected(false);
         assert_eq!(VECTOR_WIDTHS[app.vector_width], "16");
     }
@@ -1446,6 +1670,62 @@ mod tests {
         assert!(app.worker.is_none());
         assert_eq!(app.history.len(), 1);
         assert_eq!(app.history[0].status, EntryStatus::Failed);
+    }
+
+    #[test]
+    fn run_program_uses_automatic_comparison_without_a_config() {
+        let app = App::default();
+        let arguments = app.program_command_arguments();
+        assert!(arguments.contains(&"--compare-auto".to_owned()));
+        assert!(arguments.contains(&"--compare-report-json".to_owned()));
+        assert!(!arguments.contains(&"--compare-config".to_owned()));
+    }
+
+    #[test]
+    fn run_program_rejects_a_nonexistent_explicit_config() {
+        let mut app = App {
+            compare_config: TextField::new("missing-compare-config.json"),
+            ..App::default()
+        };
+        app.run_program();
+        assert!(app.worker.is_none());
+        assert_eq!(app.history[0].status, EntryStatus::Failed);
+        assert!(app.history[0].detail.contains("compare config"));
+    }
+
+    #[test]
+    fn program_comparison_view_shows_outputs_and_runtime() {
+        let mut app = App {
+            program_report: Some(ProgramReport {
+                baseline_stdout: "normal result".to_owned(),
+                baseline_stderr: String::new(),
+                candidate_stdout: "vectorized result".to_owned(),
+                candidate_stderr: String::new(),
+                baseline_run_ms: 12.5,
+                candidate_run_ms: 8.25,
+                iterations: 3,
+                warmup_iterations: 1,
+                outputs_match: false,
+                within_regression_limit: true,
+            }),
+            view: ViewMode::Programs,
+            ..App::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).expect("test terminal");
+        terminal.draw(|frame| draw(frame, &app)).expect("render");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        for expected in [
+            "normal result",
+            "vectorized result",
+            "12.500 ms",
+            "8.250 ms",
+            "outputs differ",
+            "warm-up",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.view, ViewMode::Config);
     }
 
     #[test]
@@ -1603,7 +1883,7 @@ mod tests {
     #[test]
     fn view_diff_button_only_activates_once_a_diff_exists() {
         let mut app = App {
-            focused: 8,
+            focused: 10,
             ..App::default()
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1670,12 +1950,25 @@ mod tests {
         assert!(rendered.contains("No runs yet"));
         // The CTA controls render as their own boxed buttons now, not
         // plain "[ Run vectorizer ]" text inside the form list.
-        assert!(rendered.contains("Run vectorizer"));
+        assert!(rendered.contains("Vectorize"));
+        assert!(rendered.contains("Run program"));
         assert!(rendered.contains("View diff"));
         // Policy is a segmented control showing every option at once.
         assert!(rendered.contains("balanced"));
         assert!(rendered.contains("conservative"));
         assert!(rendered.contains("aggressive"));
+    }
+
+    #[test]
+    fn run_program_button_fits_an_eighty_by_twenty_four_terminal() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &App::default()))
+            .expect("render TUI");
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Vec"));
+        assert!(rendered.contains("Program"));
+        assert!(rendered.contains("Diff"));
     }
 
     #[test]
